@@ -67,7 +67,7 @@ def parse_args(base_parser, args, namespace):
         choices=["linear", "cosine", "exp", "miror_cosine", "square", "sqrt"],
     )
     # Optimization
-    parser.add_argument("--opt", default="adamw", choices=["adamw", "sgd", "SFAdamW"])
+    parser.add_argument("--opt", default="adamw", choices=["adamw", "sgd", "SFAdamW", "muon"])
     parser.add_argument("--batch-size", default=50, type=int)
     parser.add_argument("--acc-steps", default=4, type=int)
     parser.add_argument("--weight-decay", default=1e-1, type=float)

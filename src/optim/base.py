@@ -204,7 +204,8 @@ def train(
         if cfg.opt == "SFAdamW":
             opt.train()
         opt.step()
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
         opt.zero_grad(set_to_none=True)
         if cfg.weight_average:
             weight_averager.step(

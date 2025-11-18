@@ -8,7 +8,8 @@ export VOCAB_SIZE=32000 # 50304
 export BATCH_SIZE=64
 export ACC_STEPS=8
 export SEQUENCE_LENGTH=512
-export DATASET="c4" # "slimpajama"
+# export DATASET="c4" # "slimpajama"
+export DATASET="slimpajama"
 
 # 30M
 export N_LAYER=6
@@ -85,10 +86,10 @@ export ITERATIONS=$((TOKENS / (BATCH_SIZE * ACC_STEPS * SEQUENCE_LENGTH)))
 export WARMUP_STEPS=$((ITERATIONS / 10))
 
 WANDB_PREFIX="UNTIED-${MODEL_SIZE_PREFIX}-${W_QUANT}@${W_BITS}:${A_QUANT}@${A_BITS}-${DATASET}"
-
+MASTER_PORT=22520
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 
-torchrun --nproc_per_node=${NUM_GPUS} ./src/main.py \
+torchrun --master_port=${MASTER_PORT} --nproc_per_node=${NUM_GPUS} ./src/main.py \
     --distributed-backend nccl \
     --dataset ${DATASET} \
     --model llama \

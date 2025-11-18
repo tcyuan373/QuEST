@@ -15,7 +15,7 @@ import distributed
 from models.utils import get_model
 from optim.base import train
 from optim.utils import cos_inf_schedule, wsd_schedule
-
+from muon import Muon
 
 def main(args):
     distributed_backend = distributed.make_backend_from_args(args)
@@ -77,7 +77,7 @@ def main(args):
         params_cnt
         - distributed_backend.get_raw_model(model).lm_head.weight.numel()
         - distributed_backend.get_raw_model(model).transformer.wte.weight.numel()
-    )
+    )    
     print("number of parameters: %.2fM" % (params_cnt / 1e6,))
     print("number of optimized parameters: %.2fM" % (optimized_params_cnt / 1e6,))
     print("number of non-embedding parameters: %.2fM" % (nonemb_param_cnt / 1e6,))
@@ -105,7 +105,14 @@ def main(args):
             weight_decay=args.weight_decay,
             warmup_steps=args.warmup_steps,
         )
-
+    elif args.opt == "muon":
+        opt = Muon(
+            muon_params = group_specs[0]['params'],
+            adamw_params = group_specs[-1]['params'],
+            lr=args.lr,
+            wd=args.weight_decay,
+        )
+        
     else:
         opt = torch.optim.SGD(
             group_specs, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay
@@ -117,16 +124,20 @@ def main(args):
         if args.scheduler in ["cos", "linear"]:
             # initial lr is args.lr / div_factor
             # final lr is initial_lr/final_div_factor = args.lr / div_factor / final_div_factor
+            if args.opt != "muon":
+                max_lr = [group.get("lr", args.lr) for group in group_specs]
+            else:
+                max_lr = [args.lr]
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer=opt,
-                max_lr=[group.get("lr", args.lr) for group in group_specs],
+                max_lr=max_lr,
                 total_steps=args.iterations,
                 pct_start=args.warmup_steps / args.iterations,
                 anneal_strategy=args.scheduler,
                 cycle_momentum=False,
                 div_factor=1e2,
                 final_div_factor=0.1,
-            )
+            )  
         elif args.scheduler == "cos_inf":
             lambda_schedule = cos_inf_schedule(
                 n_iterations=args.iterations,

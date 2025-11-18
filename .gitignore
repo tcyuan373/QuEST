@@ -1,12 +1,14 @@
 # Datasets, assets, logging
 datasets/
 wandb/
+slurm_logs/
 exps/
 scripts/
 cluster/
 assets/*.csv
 assets/*.json
 
+*.sub
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
