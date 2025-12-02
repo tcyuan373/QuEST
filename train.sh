@@ -12,20 +12,20 @@ export SEQUENCE_LENGTH=512
 export DATASET="slimpajama"
 
 # 30M
-export N_LAYER=6
-export N_EMBD=640
-export N_HEAD=5
-export LR=0.0012
-export TOKENS=3000000000 # 3B
-export MODEL_SIZE_PREFIX="30M"
+# export N_LAYER=6
+# export N_EMBD=640
+# export N_HEAD=5
+# export LR=0.0012
+# export TOKENS=3000000000 # 3B
+# export MODEL_SIZE_PREFIX="30M"
 
 # # 50M
-# export N_LAYER=7
-# export N_EMBD=768
-# export N_HEAD=6
-# export LR=0.0012
-# export TOKENS=5000000000 # 5B
-# export MODEL_SIZE_PREFIX="50M"
+export N_LAYER=7
+export N_EMBD=768
+export N_HEAD=6
+export LR=0.0012
+export TOKENS=5000000000 # 5B
+export MODEL_SIZE_PREFIX="50M"
 
 # # 100M
 # export N_LAYER=8
@@ -80,15 +80,20 @@ export W_QUANT="HalfHadamardTrustQuantizer"
 export A_QUANT="HalfHadamardTrustQuantizer"
 export W_QUANT_KWARGS="{\"bits\": 4}"
 export A_QUANT_KWARGS="{\"bits\": 4}"
-
+# export W_QUANT="HalfHadamardFP4TrustQuantizer"
+# export A_QUANT="HalfHadamardFP4TrustQuantizer"
 # Calculate the number of iterations based on tokens and batch settings
 export ITERATIONS=$((TOKENS / (BATCH_SIZE * ACC_STEPS * SEQUENCE_LENGTH)))
 export WARMUP_STEPS=$((ITERATIONS / 10))
 
 WANDB_PREFIX="UNTIED-${MODEL_SIZE_PREFIX}-${W_QUANT}@${W_BITS}:${A_QUANT}@${A_BITS}-${DATASET}"
-MASTER_PORT=22520
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
-
+export MASTER_PORT=$(
+    shuf -i 22521-65535 -n 1 | \
+    while read p; do
+        if ! ss -tuln | grep -q ":$p "; then echo $p; break; fi
+    done
+)
 torchrun --master_port=${MASTER_PORT} --nproc_per_node=${NUM_GPUS} ./src/main.py \
     --distributed-backend nccl \
     --dataset ${DATASET} \
@@ -109,4 +114,25 @@ torchrun --master_port=${MASTER_PORT} --nproc_per_node=${NUM_GPUS} ./src/main.py
     --w-quant ${W_QUANT} \
     --w-quant-kwargs "${W_QUANT_KWARGS}" \
     --a-quant ${A_QUANT} \
-    --a-quant-kwargs "${A_QUANT_KWARGS}"
+    --a-quant-kwargs "${A_QUANT_KWARGS}" \
+    # --opt muon \
+# torchrun --master_port=${MASTER_PORT} --nproc_per_node=${NUM_GPUS} ./src/main.py \
+#     --distributed-backend nccl \
+#     --dataset ${DATASET} \
+#     --model llama \
+#     --compile \
+#     --latest-ckpt-interval 1000 \
+#     --acc-steps ${ACC_STEPS} \
+#     --batch-size ${BATCH_SIZE} \
+#     --wandb \
+#     --wandb-project "llm-baselines" \
+#     --wandb-run-prefix "${WANDB_PREFIX}" \
+#     --n-layer ${N_LAYER} \
+#     --n-embd ${N_EMBD} \
+#     --n-head ${N_HEAD} \
+#     --warmup-steps ${WARMUP_STEPS} \
+#     --iterations ${ITERATIONS} \
+#     --lr ${LR} \
+#     --w-quant ${W_QUANT} \
+#     --a-quant ${A_QUANT} \
+#     --opt muon \

@@ -60,24 +60,54 @@ def main(args):
     print(f"\nModel:\n{model}")
 
     model = distributed_backend.transform_model(model)
-    group_specs = distributed_backend.get_raw_model(model).get_parameter_group_specs()
+    raw_model = distributed_backend.get_raw_model(model)
+    group_specs = raw_model.get_parameter_group_specs()
     param_name_mapping = {p_name: p for p_name, p in model.named_parameters()}
     optimized_params_cnt = 0
-    for g in group_specs:
-        params = []
-        for p_name in g["params"]:
-            translated_p_names = (
-                distributed_backend.translate_model_parameter_name_for_node(p_name)
-            )
-            params += [param_name_mapping[p_name] for p_name in translated_p_names]
-        g["params"] = params
-        optimized_params_cnt += sum([p.numel() for p in g["params"]])
-    params_cnt = distributed_backend.get_raw_model(model).get_num_params()
+    params_cnt = raw_model.get_num_params()
     nonemb_param_cnt = (
         params_cnt
-        - distributed_backend.get_raw_model(model).lm_head.weight.numel()
-        - distributed_backend.get_raw_model(model).transformer.wte.weight.numel()
+        - raw_model.lm_head.weight.numel()
+        - raw_model.transformer.wte.weight.numel()
     )    
+    embedding_params = {
+        raw_model.lm_head.weight,
+        raw_model.transformer.wte.weight,
+    }
+    def is_embedding_param(p):
+        return p in embedding_params
+    
+    if args.opt == "muon":
+        muon_groups = []
+        adamw_groups = []
+        for g in group_specs:
+            params = []
+            for p_name in g["params"]:
+                translated_p_names = distributed_backend.translate_model_parameter_name_for_node(p_name)
+                params.extend([param_name_mapping[pn] for pn in translated_p_names])
+            # Replace params
+            g["params"] = params
+            # Partition by ndim + embedding exclusion
+            muon_params = [p for p in params if p.ndim >= 2 and not is_embedding_param(p)]
+            # adamw_params = [p for p in params if p is not None and id(p) not in {id(mp) for mp in muon_params}]
+            muon_ids = {id(p) for p in muon_params}
+            adamw_params = [p for p in params if id(p) not in muon_ids]
+
+            if muon_params:
+                muon_groups.append({"params": muon_params})
+            if adamw_params:
+                adamw_groups.append({"params": adamw_params})
+    else:
+        for g in group_specs:
+            params = []
+            for p_name in g["params"]:
+                translated_p_names = (
+                    distributed_backend.translate_model_parameter_name_for_node(p_name)
+                )
+                params += [param_name_mapping[p_name] for p_name in translated_p_names]
+            g["params"] = params
+            optimized_params_cnt += sum([p.numel() for p in g["params"]])
+    
     print("number of parameters: %.2fM" % (params_cnt / 1e6,))
     print("number of optimized parameters: %.2fM" % (optimized_params_cnt / 1e6,))
     print("number of non-embedding parameters: %.2fM" % (nonemb_param_cnt / 1e6,))
@@ -106,9 +136,12 @@ def main(args):
             warmup_steps=args.warmup_steps,
         )
     elif args.opt == "muon":
+        print("Muon params:", sum(p.numel() for g in muon_groups for p in g["params"]) / 1e6, "M")
+        print("AdamW params:", sum(p.numel() for g in adamw_groups for p in g["params"]) / 1e6, "M")
+
         opt = Muon(
-            muon_params = group_specs[0]['params'],
-            adamw_params = group_specs[-1]['params'],
+            muon_params = muon_params,
+            adamw_params = adamw_params,
             lr=args.lr,
             wd=args.weight_decay,
         )
@@ -220,6 +253,7 @@ def get_exp_name(args, distributed_backend):
         f"_decay_{args.decay_type}_{args.wsd_fract_decay}"
         f"_iter{args.iterations}"
         f"_bs{args.batch_size}x{args.acc_steps}_ws{args.world_size}"
+        f"_opt_{args.opt}"
     )
     # for mup
     if args.model == "mup_noam":
