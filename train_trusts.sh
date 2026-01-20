@@ -8,7 +8,7 @@ export VOCAB_SIZE=32000 # 50304
 export BATCH_SIZE=64
 export ACC_STEPS=8
 export SEQUENCE_LENGTH=512
-export DATASET="c4" # "slimpajama"
+export DATASET="slimpajama" # "slimpajama"
 
 # # 30M
 # export N_LAYER=6
@@ -40,7 +40,7 @@ CLIP_SCALE_VALUES=(1.05 1.05 1.15 1.35 1.45 1.50)
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 
 # Loop through trust values
-for TRUST in "${TRUST_VALUES[@]}"; do
+for TRUST in "${CLIP_SCALE_VALUES[@]}"; do
     echo "Running with TRUST=${TRUST}"
 
     # Update quantization kwargs with current trust value

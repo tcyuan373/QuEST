@@ -2,7 +2,6 @@
 
 # Exit immediately if a command exits with a non-zero status
 set -e
-
 # Set common environment variables
 export VOCAB_SIZE=32000 # 50304
 export BATCH_SIZE=64
@@ -76,10 +75,16 @@ export MODEL_SIZE_PREFIX="50M"
 # export MODEL_SIZE_PREFIX="3200M"
 
 # Quantization configuration
-export W_QUANT="HalfHadamardTrustQuantizer"
-export A_QUANT="HalfHadamardTrustQuantizer"
+# export W_QUANT="HalfHadamardTrustQuantizer"
+# export A_QUANT="HalfHadamardTrustQuantizer"
+export W_QUANT="FP4STEQuantizer"
+export A_QUANT="FP4STEQuantizer"
+export W_BITS=4
+export A_BITS=4
 export W_QUANT_KWARGS="{\"bits\": 4}"
 export A_QUANT_KWARGS="{\"bits\": 4}"
+# export W_QUANT_KWARGS="{\"bits\": 4, \"clipping\": false}"
+# export A_QUANT_KWARGS="{\"bits\": 4, \"clipping\": false}"
 # export W_QUANT="HalfHadamardFP4TrustQuantizer"
 # export A_QUANT="HalfHadamardFP4TrustQuantizer"
 # Calculate the number of iterations based on tokens and batch settings
@@ -88,6 +93,7 @@ export WARMUP_STEPS=$((ITERATIONS / 10))
 
 WANDB_PREFIX="UNTIED-${MODEL_SIZE_PREFIX}-${W_QUANT}@${W_BITS}:${A_QUANT}@${A_BITS}-${DATASET}"
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+# NUM_GPUS=2
 export MASTER_PORT=$(
     shuf -i 22521-65535 -n 1 | \
     while read p; do
@@ -102,9 +108,6 @@ torchrun --master_port=${MASTER_PORT} --nproc_per_node=${NUM_GPUS} ./src/main.py
     --latest-ckpt-interval 1000 \
     --acc-steps ${ACC_STEPS} \
     --batch-size ${BATCH_SIZE} \
-    --wandb \
-    --wandb-project "llm-baselines" \
-    --wandb-run-prefix "${WANDB_PREFIX}" \
     --n-layer ${N_LAYER} \
     --n-embd ${N_EMBD} \
     --n-head ${N_HEAD} \
@@ -112,9 +115,13 @@ torchrun --master_port=${MASTER_PORT} --nproc_per_node=${NUM_GPUS} ./src/main.py
     --iterations ${ITERATIONS} \
     --lr ${LR} \
     --w-quant ${W_QUANT} \
-    --w-quant-kwargs "${W_QUANT_KWARGS}" \
     --a-quant ${A_QUANT} \
-    --a-quant-kwargs "${A_QUANT_KWARGS}" \
+    --auto-resume False \
+    --wandb \
+    --wandb-project "llm-baselines" \
+    --wandb-run-prefix "${WANDB_PREFIX}" \
+    # --a-quant-kwargs "${A_QUANT_KWARGS}" \
+    # --w-quant-kwargs "${W_QUANT_KWARGS}" \
     # --opt muon \
 # torchrun --master_port=${MASTER_PORT} --nproc_per_node=${NUM_GPUS} ./src/main.py \
 #     --distributed-backend nccl \

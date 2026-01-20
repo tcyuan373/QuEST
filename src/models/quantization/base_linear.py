@@ -7,6 +7,21 @@ from scipy import integrate
 from scipy.stats import norm
 
 from fast_hadamard_transform import hadamard_transform
+from torch.autograd import Function
+
+class ClippedSTE(Function):
+    @staticmethod
+    def forward(ctx, x, xq, x_min, x_max):
+        ctx.save_for_backward(x, x_min, x_max)
+        return xq
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, x_min, x_max = ctx.saved_tensors
+        mask = (x >= x_min) & (x <= x_max)
+        grad_x = grad_output * mask
+        # no grad for xq, x_min, x_max
+        return grad_x, None, None, None
 
 
 class BaseQuantizer(nn.Module):
@@ -979,6 +994,417 @@ class ClipAccQuantizer(STEQuantizer):
 
         return grad_flow_output + (xq - grad_flow_output).detach()
 
+class SRSTEQuantizer(STEQuantizer):
+    def __init__(self, bits=4, centered=True):
+        super().__init__(bits, centered) 
+
+    def round_stoch_fp4(self, x):
+        SCALE = torch.tensor((1 << 23), dtype=torch.int32).view(torch.float32)
+        SCALE_INV = SCALE.reciprocal()
+        MASK = (SCALE * (-6)).view(torch.int32)
+        x = x.to(torch.float32)
+        x = x.clamp(min=-6, max=6)
+        x = x * SCALE
+        x = x.view(torch.int32)
+        x = x + torch.randint_like(x, low=0, high=(1<<22))
+        x = x & MASK
+        x = x.view(torch.float32)
+        return x * SCALE_INV
+    
+    def forward(self, x, clamp_grad=False):
+        with torch.no_grad():
+            xq = self.round_stoch_fp4(x)
+        y = x + (xq - x).detach()
+        if not clamp_grad:
+            return y
+        # Optional: zero gradient outside clamp range (since forward clamps anyway)
+        mask = (x >= -6) & (x <= 6)
+        # This keeps forward identical to y but scales gradient by mask
+        return x + (y - x).detach() * 1.0 + (x - x.detach()) * mask.to(x.dtype)
+    
+class SR2STEQuantizer(STEQuantizer):
+    def __init__(self, bits=4, centered=True):
+        super().__init__(bits, centered) 
+
+    def round_stoch_fp4(self, x):
+        SCALE = torch.tensor((1 << 23), dtype=torch.int32).view(torch.float32)
+        SCALE_INV = SCALE.reciprocal()
+        MASK = (SCALE * (-6)).view(torch.int32)
+        x = x.to(torch.float32)
+        x = x.clamp(min=-6, max=6)
+        x = x * SCALE
+        x = x.view(torch.int32)
+        x = x + torch.randint_like(x, low=0, high=(1<<22))
+        x = x & MASK
+        x = x.view(torch.float32)
+        return x * SCALE_INV
+    
+    def forward(self, x, clamp_grad=False):
+        with torch.no_grad():
+            xq = self.round_stoch_fp4(x)
+            
+        return x + (xq - x).detach()
+        
+
+
+
+class StochasticSTEQuantizer(STEQuantizer):
+    def __init__(self, bits=4, centered=True, stochastic_eval=False):
+        super().__init__(bits, centered)
+        self.stochastic_eval = stochastic_eval
+
+    def forward(self, x):
+
+        if self.centered:
+            max_val = torch.quantile(x.abs().to(torch.float32), 0.999, dim=-1, keepdim=True).to(x.dtype)
+            scale = max_val + 1e-8
+        else:
+            max_val = x.amax(dim=-1, keepdim=True)
+            min_val = x.amin(dim=-1, keepdim=True)
+            scale = (max_val - min_val) + 1e-8
+
+        if self.centered:
+            step = 2 * scale / (self.n_levels - 1)
+            
+            x_clip = torch.clamp(x, -scale, scale)
+            val_to_round = x_clip / step + 0.5
+        else:
+            step = scale / self.n_levels 
+            x_clip = torch.clamp(x, min_val, max_val)
+            val_to_round = (x_clip - min_val) / step
+
+        if self.training or self.stochastic_eval:
+            x_int = self.stochastic_round(val_to_round)
+        else:
+            x_int = torch.floor(val_to_round)
+
+        if self.centered:
+            xq = x_int * step - step / 2
+        else:
+            xq = x_int * step + min_val
+
+        return x + (xq - x).detach()
+
+
+    def stochastic_round(self, x):
+        return torch.floor(x + torch.rand_like(x))
+
+class StoRoundingSTEQuantizer(STEQuantizer):
+    def __init__(self, bits=4, centered=True, stochastic=True, eval_deterministic=True):
+        """
+        stochastic        : enable stochastic rounding during training
+        eval_deterministic: if True, fall back to deterministic rounding in eval mode
+                            (useful if you want stable eval metrics)
+        """
+        super().__init__(bits=bits, centered=centered)
+        self.stochastic = stochastic
+        self.eval_deterministic = eval_deterministic
+
+    @staticmethod
+    def _stochastic_round(r: torch.Tensor,
+                          qmin: float = None,
+                          qmax: float = None) -> torch.Tensor:
+        """
+        Stochastic rounding:
+          r = real-valued index
+          q = floor(r) with prob (1 - frac), ceil(r) with prob frac
+        Optionally clamp to [qmin, qmax].
+        """
+        lower = torch.floor(r)
+        frac = r - lower  # in [0, 1)
+        u = torch.rand_like(frac)
+        upper = lower + 1.0
+
+        choose_upper = (u < frac).to(r.dtype)
+        q = lower + choose_upper
+
+        if qmin is not None or qmax is not None:
+            if qmin is None:
+                qmin = -float("inf")
+            if qmax is None:
+                qmax = float("inf")
+            q = q.clamp(qmin, qmax)
+
+        return q
+
+    def forward(self, x):
+        # fall back to original deterministic STE in eval mode (optional)
+        if (not self.training and self.eval_deterministic) or (not self.stochastic):
+            return super().forward(x)
+
+        scale = (
+            OPTIMAL_GAUSSIAN_SCALES[self.bits]
+            * torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True))
+            + 1e-8
+        )
+
+        if self.centered:
+            # centered symmetric quantization:
+            #   step = 2*scale/(n_levels-1)
+            #   original: xq = round(x_clip/step + 0.5)*step - step/2
+            step = 2 * scale / (self.n_levels - 1)
+            x_clip = torch.clamp(x, -scale, scale)
+
+            r = x_clip / step + 0.5  # "index" before rounding
+            # valid indices are [0, n_levels-1]
+            q = self._stochastic_round(
+                r,
+                qmin=0.0,
+                qmax=float(self.n_levels - 1),
+            )
+            xq = q * step - step / 2
+
+        else:
+            # uncentered (e.g. for activations):
+            #   step = 2*scale/n_levels
+            #   original: xq = round(x_clip/step)*step
+            step = 2 * scale / self.n_levels
+            x_clip = torch.clamp(
+                x,
+                -scale * (self.n_levels - 2) / self.n_levels,
+                scale,
+            )
+
+            r = x_clip / step
+            # roughly valid index range: [-(n_levels-2)/2, n_levels/2]
+            q = self._stochastic_round(
+                r,
+                qmin=-(self.n_levels // 2),
+                qmax=self.n_levels // 2,
+            )
+            xq = q * step
+
+        return x + (xq - x).detach()
+
+
+class PartialSRSTEQuantizer(STEQuantizer):
+    def __init__(
+        self,
+        bits=4,
+        centered=True,
+        stochastic=True,
+        eval_deterministic=True,
+        clipping=True,
+        sr_prob: float = 0.1,   # fraction of entries using SR
+    ):
+        """
+        stochastic        : enable stochastic rounding during training
+        eval_deterministic: use deterministic quant at eval time
+        sr_prob           : probability that a given entry uses SR instead of round()
+                            sr_prob=0 => pure deterministic
+                            sr_prob=1 => all entries SR
+        """
+        super().__init__(bits=bits, centered=centered)
+        self.stochastic = stochastic
+        self.eval_deterministic = eval_deterministic
+        self.sr_prob = float(sr_prob)
+        self.clipping = clipping
+        
+    @staticmethod
+    def _stochastic_round(r: torch.Tensor,
+                          qmin: float = None,
+                          qmax: float = None) -> torch.Tensor:
+        """
+        Elementwise SR:
+          r = real-valued index
+          q = floor(r) w.p. (1 - frac), ceil(r) w.p. frac
+        """
+        lower = torch.floor(r)
+        frac = r - lower                           # in [0,1)
+        u = torch.rand_like(frac)                  # elementwise RNG
+        choose_upper = (u < frac).to(r.dtype)
+        q = lower + choose_upper
+
+        if qmin is not None or qmax is not None:
+            if qmin is None:
+                qmin = -float("inf")
+            if qmax is None:
+                qmax = float("inf")
+            q = q.clamp(qmin, qmax)
+        return q
+
+
+    @staticmethod
+    def _det_round(r: torch.Tensor,
+                   qmin: float = None,
+                   qmax: float = None) -> torch.Tensor:
+        q = torch.round(r)
+        if qmin is not None or qmax is not None:
+            if qmin is None:
+                qmin = -float("inf")
+            if qmax is None:
+                qmax = float("inf")
+            q = q.clamp(qmin, qmax)
+        return q
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Pure deterministic paths – these are Python bools, safe for Dynamo
+        if (not self.training and self.eval_deterministic) or (not self.stochastic):
+            return super().forward(x)
+
+        if self.sr_prob <= 0.0:
+            return super().forward(x)
+
+        scale = (
+            OPTIMAL_GAUSSIAN_SCALES[self.bits]
+            * torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True))
+            + 1e-8
+        )
+
+        if self.centered:
+            # centered symmetric grid
+            step = 2 * scale / (self.n_levels - 1)
+            x_clip = torch.clamp(x, -scale, scale)
+
+            # original index: round(x_clip/step + 0.5)
+            r = x_clip / step + 0.5
+            qmin, qmax = 0.0, float(self.n_levels - 1)
+        else:
+            # uncentered grid
+            step = 2 * scale / self.n_levels
+            x_clip = torch.clamp(
+                x,
+                -scale * (self.n_levels - 2) / self.n_levels,
+                scale,
+            )
+            r = x_clip / step
+            qmin, qmax = -(self.n_levels // 2), self.n_levels // 2
+
+        q_sr  = self._stochastic_round(r, qmin=qmin, qmax=qmax)
+        q_det = self._det_round(r, qmin=qmin, qmax=qmax)
+
+        mask = (torch.rand_like(r) < self.sr_prob).to(r.dtype)
+        q = mask * q_sr + (1.0 - mask) * q_det
+
+        if self.centered:
+            xq = q * step - step / 2
+        else:
+            xq = q * step
+
+        if self.clipping:
+            x_min = -scale if self.centered else -scale * (self.n_levels - 2) / self.n_levels
+            x_max =  scale
+            
+            y = ClippedSTE.apply(x, xq, x_min, x_max)
+            return y
+        
+        else:
+            return x + (xq - x).detach()
+
+
+class PartialRowwiseSRSTEQuantizer(STEQuantizer):
+    def __init__(
+        self,
+        bits=4,
+        centered=True,
+        stochastic=True,
+        eval_deterministic=True,
+        clipping=True,
+        sr_prob: float = 0.1,   # fraction of entries using SR
+    ):
+        """
+        stochastic        : enable stochastic rounding during training
+        eval_deterministic: use deterministic quant at eval time
+        sr_prob           : probability that a given entry uses SR instead of round()
+                            sr_prob=0 => pure deterministic
+                            sr_prob=1 => all entries SR
+        """
+        super().__init__(bits=bits, centered=centered)
+        self.stochastic = stochastic
+        self.eval_deterministic = eval_deterministic
+        self.sr_prob = float(sr_prob)
+        self.clipping = clipping
+
+    @staticmethod
+    def _stochastic_round_rowwise(r: torch.Tensor,
+                                  qmin: float = None,
+                                  qmax: float = None) -> torch.Tensor:
+        """
+        r: (..., D) - we share the noise across the last dimension.
+        """
+        lower = torch.floor(r)
+        frac = r - lower                           # (..., D)
+        # sample one u per row (all but last dim)
+        noise_shape = r.shape[:-1] + (1,)
+        u = torch.rand(noise_shape, device=r.device, dtype=r.dtype)
+        choose_upper = (u < frac).to(r.dtype)      # broadcast over last dim
+        q = lower + choose_upper
+        if qmin is not None or qmax is not None:
+            if qmin is None:
+                qmin = -float("inf")
+            if qmax is None:
+                qmax = float("inf")
+            q = q.clamp(qmin, qmax)
+        return q
+
+
+    @staticmethod
+    def _det_round(r: torch.Tensor,
+                   qmin: float = None,
+                   qmax: float = None) -> torch.Tensor:
+        q = torch.round(r)
+        if qmin is not None or qmax is not None:
+            if qmin is None:
+                qmin = -float("inf")
+            if qmax is None:
+                qmax = float("inf")
+            q = q.clamp(qmin, qmax)
+        return q
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (not self.training and self.eval_deterministic) or (not self.stochastic):
+            return super().forward(x)
+
+        if self.sr_prob <= 0.0:
+            return super().forward(x)
+
+        scale = (
+            OPTIMAL_GAUSSIAN_SCALES[self.bits]
+            * torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True))
+            + 1e-8
+        )
+
+        if self.centered:
+            # centered symmetric grid
+            step = 2 * scale / (self.n_levels - 1)
+            x_clip = torch.clamp(x, -scale, scale)
+
+            # original index: round(x_clip/step + 0.5)
+            r = x_clip / step + 0.5
+            qmin, qmax = 0.0, float(self.n_levels - 1)
+        else:
+            step = 2 * scale / self.n_levels
+            x_clip = torch.clamp(
+                x,
+                -scale * (self.n_levels - 2) / self.n_levels,
+                scale,
+            )
+            r = x_clip / step
+            qmin, qmax = -(self.n_levels // 2), self.n_levels // 2
+
+        q_sr  = self._stochastic_round_rowwise(r, qmin=qmin, qmax=qmax)
+        q_det = self._det_round(r, qmin=qmin, qmax=qmax)
+        mask = (torch.rand_like(r) < self.sr_prob).to(r.dtype)
+        q = mask * q_sr + (1.0 - mask) * q_det
+
+        if self.centered:
+            xq = q * step - step / 2
+        else:
+            xq = q * step
+            
+            
+            
+        if self.clipping:
+            x_min = -scale if self.centered else -scale * (self.n_levels - 2) / self.n_levels
+            x_max =  scale
+            
+            y = ClippedSTE.apply(x, xq, x_min, x_max)
+            return y
+        
+        else:
+            return x + (xq - x).detach()
+
+
 
 class LSQQuantizer(nn.Module):
     """
@@ -1164,6 +1590,10 @@ QUANTIZER_CLASSES = {
     "LSQQuantizer": LSQQuantizer,
     "LSQPlusActivationQuantizer": LSQPlusActivationQuantizer,
     "LSQPlusWeightQuantizer": LSQPlusWeightQuantizer,
+    "StochasticFP4STEQuantizer": SRSTEQuantizer,
+    "SR2STEQuantizer": SR2STEQuantizer,
+    "PartialSRSTEQuantizer": PartialSRSTEQuantizer,
+    "PartialRowwiseSRSTEQuantizer": PartialRowwiseSRSTEQuantizer,
 }
 
 

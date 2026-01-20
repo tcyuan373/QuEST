@@ -17,6 +17,12 @@ from optim.base import train
 from optim.utils import cos_inf_schedule, wsd_schedule
 from muon import Muon
 
+
+import torch._dynamo as dynamo
+dynamo.config.optimize_ddp = False
+
+
+
 def main(args):
     distributed_backend = distributed.make_backend_from_args(args)
     args = distributed_backend.get_adjusted_args_for_process(args)
