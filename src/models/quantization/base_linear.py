@@ -1023,8 +1023,9 @@ class SRSTEQuantizer(STEQuantizer):
         return x + (y - x).detach() * 1.0 + (x - x.detach()) * mask.to(x.dtype)
     
 class SR2STEQuantizer(STEQuantizer):
-    def __init__(self, bits=4, centered=True):
+    def __init__(self, bits=4, eps=1e-8, centered=True):
         super().__init__(bits, centered) 
+        self.eps = eps
 
     def round_stoch_fp4(self, x):
         SCALE = torch.tensor((1 << 23), dtype=torch.int32).view(torch.float32)
@@ -1040,12 +1041,14 @@ class SR2STEQuantizer(STEQuantizer):
         return x * SCALE_INV
     
     def forward(self, x, clamp_grad=False):
+        scale = torch.sqrt(torch.mean(x.float() * x.float(), dim=-1, keepdim=True) + self.eps)
         with torch.no_grad():
-            xq = self.round_stoch_fp4(x)
-            
+            x = x / (scale + self.eps)
+            xq_norm = self.round_stoch_fp4(x)
+            xq = xq_norm * scale
+        
         return x + (xq - x).detach()
         
-
 
 
 class StochasticSTEQuantizer(STEQuantizer):
@@ -1591,7 +1594,7 @@ QUANTIZER_CLASSES = {
     "LSQPlusActivationQuantizer": LSQPlusActivationQuantizer,
     "LSQPlusWeightQuantizer": LSQPlusWeightQuantizer,
     "StochasticFP4STEQuantizer": SRSTEQuantizer,
-    "SR2STEQuantizer": SR2STEQuantizer,
+    "SRSTEQuantizer": SR2STEQuantizer,
     "PartialSRSTEQuantizer": PartialSRSTEQuantizer,
     "PartialRowwiseSRSTEQuantizer": PartialRowwiseSRSTEQuantizer,
 }
