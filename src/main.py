@@ -154,6 +154,7 @@ def main(args):
             adamw_params = all_adamw_params,
             lr=args.lr,
             wd=args.weight_decay,
+            momentum=args.muon_momentum,
             sr_mode=args.muon_sr_mode,
             sr_bits=args.muon_sr_bits,
             sr_qmc=args.muon_sr_qmc,

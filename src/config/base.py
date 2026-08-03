@@ -79,6 +79,7 @@ def parse_args(base_parser, args, namespace):
         "--muon-sr-mode", default="none", choices=["none", "update", "weight"]
     )
     parser.add_argument("--muon-sr-bits", default=4, type=int)
+    parser.add_argument("--muon-momentum", default=0.95, type=float)
     parser.add_argument(
         "--muon-sr-qmc",
         default=True,

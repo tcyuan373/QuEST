@@ -76,7 +76,12 @@ fi
 export A_QUANT="STEQuantizer"      # activations deterministic in every arm
 
 export ITERATIONS=$((TOKENS / (BATCH_SIZE * ACC_STEPS * SEQUENCE_LENGTH)))
-export WARMUP_STEPS=$((ITERATIONS / 10))
+# hyperparam-sweep knobs (defaults reproduce all prior runs)
+WARMUP_PCT=${WARMUP_PCT:-10}                 # warmup as %% of iterations
+export MUON_MOMENTUM=${MUON_MOMENTUM:-0.95}
+export WD=${WD:-0.1}
+export SR_BITS=${SR_BITS:-4}
+export WARMUP_STEPS=$((ITERATIONS * WARMUP_PCT / 100))
 
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 export MASTER_PORT=$(
@@ -108,7 +113,9 @@ torchrun --master_port=${MASTER_PORT} --nproc_per_node=${NUM_GPUS} ./src/main.py
     --a-quant ${A_QUANT} \
     --opt muon \
     --muon-sr-mode ${MUON_SR_MODE} \
-    --muon-sr-bits 4 \
+    --muon-sr-bits ${SR_BITS} \
+    --muon-momentum ${MUON_MOMENTUM} \
+    --weight-decay ${WD} \
     --experiment-name "qmc_${NAME_TAG}_${ARM}_${MODEL_SIZE}_${RUN_SUFFIX}" \
     --auto-resume ${AUTO_RESUME}
 # Fresh-pretraining guarantee (both policies): the experiment dir embeds the
