@@ -30,7 +30,12 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--resume-from", default=None, type=str)
     parser.add_argument("--resume-from-swa", default=None, type=str)
 
-    parser.add_argument("--auto-resume", default=True)
+    # NOTE: plain type=bool would make the CLI string "False" truthy
+    parser.add_argument(
+        "--auto-resume",
+        default=True,
+        type=lambda x: str(x).lower() in ("true", "1", "yes"),
+    )
 
     # logging params (WandB)
     parser.add_argument("--wandb", action="store_true")  # whether to use wandb or not
@@ -68,6 +73,17 @@ def parse_args(base_parser, args, namespace):
     )
     # Optimization
     parser.add_argument("--opt", default="adamw", choices=["adamw", "sgd", "SFAdamW", "muon"])
+    # Muon NS-then-round: stochastically round the Newton-Schulz-orthogonalized
+    # update ("update") or the post-update master weights ("weight").
+    parser.add_argument(
+        "--muon-sr-mode", default="none", choices=["none", "update", "weight"]
+    )
+    parser.add_argument("--muon-sr-bits", default=4, type=int)
+    parser.add_argument(
+        "--muon-sr-qmc",
+        default=True,
+        type=lambda x: str(x).lower() in ("true", "1", "yes"),
+    )  # antithetic pairing across consecutive optimizer steps
     parser.add_argument("--batch-size", default=50, type=int)
     parser.add_argument("--acc-steps", default=4, type=int)
     parser.add_argument("--weight-decay", default=1e-1, type=float)
@@ -138,6 +154,8 @@ def parse_args(base_parser, args, namespace):
             "redpajama",
             "slimpajama",
             "slimpajama_chunk1",
+            "minipile",
+            "c4slice",
             "redpajamav2",
             "c4",
         ],

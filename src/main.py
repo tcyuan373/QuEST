@@ -145,11 +145,18 @@ def main(args):
         print("Muon params:", sum(p.numel() for g in muon_groups for p in g["params"]) / 1e6, "M")
         print("AdamW params:", sum(p.numel() for g in adamw_groups for p in g["params"]) / 1e6, "M")
 
+        # flatten across ALL group_specs groups (decay + no_decay); passing the
+        # bare loop variables here would silently drop every group but the last
+        all_muon_params = [p for g in muon_groups for p in g["params"]]
+        all_adamw_params = [p for g in adamw_groups for p in g["params"]]
         opt = Muon(
-            muon_params = muon_params,
-            adamw_params = adamw_params,
+            muon_params = all_muon_params,
+            adamw_params = all_adamw_params,
             lr=args.lr,
             wd=args.weight_decay,
+            sr_mode=args.muon_sr_mode,
+            sr_bits=args.muon_sr_bits,
+            sr_qmc=args.muon_sr_qmc,
         )
         
     else:

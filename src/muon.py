@@ -2,6 +2,25 @@ import math
 import torch
 
 
+# Copied from models.quantization.base_linear (importing that module pulls in
+# fast_hadamard_transform and builds CUDA tensors at import time, so we keep
+# muon.py self-contained).
+OPTIMAL_GAUSSIAN_SCALES = {
+    1: 0.7978845587140913,
+    1.585: 1.2240089519030855,
+    2: 1.4935346200015913,
+    3: 2.051068354131873,
+    4: 2.513930578568423,
+    5: 2.9160938834961225,
+    6: 3.276597282593217,
+    7: 3.6010497188221655,
+    8: 3.884938678807525,
+}
+
+# Knuth multiplicative hash constant, for mixing (step, param) into a seed.
+_SEED_MIX = 2654435761
+
+
 # This code snippet is a modified version adapted from the following GitHub repository:
 # https://github.com/KellerJordan/Muon/blob/master/muon.py
 @torch.compile
@@ -73,6 +92,9 @@ class Muon(torch.optim.Optimizer):
         adamw_params=None,
         adamw_betas=(0.9, 0.95),
         adamw_eps=1e-8,
+        sr_mode="none",  # "none" | "update" | "weight" -- NS-then-round scheme
+        sr_bits=4,
+        sr_qmc=True,  # antithetic pairing across consecutive optimizer steps
     ):
 
         defaults = dict(
@@ -90,14 +112,59 @@ class Muon(torch.optim.Optimizer):
         params.extend(adamw_params)
         super().__init__(params, defaults)
         # Sort parameters into those for which we will use Muon, and those for which we will not
-        
-        for p in muon_params:
+
+        assert sr_mode in ("none", "update", "weight"), sr_mode
+        self.sr_mode = sr_mode
+        self.sr_bits = sr_bits
+        self.sr_qmc = sr_qmc
+        self._sr_step_cnt = 0  # optimizer-step counter driving the QMC sequence
+
+        for idx, p in enumerate(muon_params):
             # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
             assert p.ndim == 2, p.ndim
             self.state[p]["use_muon"] = True
+            # fixed per-parameter seed offset so QMC streams are independent
+            # across parameters but reproducible across the antithetic pair
+            self.state[p]["sr_param_seed"] = (idx + 1) * 0x9E3779B1
         for p in adamw_params:
             # Do not use Muon for parameters in adamw_params
             self.state[p]["use_muon"] = False
+
+    def _qmc_sr_round(self, x, param_seed):
+        """NS-then-round: stochastically round `x` onto a rowwise Gaussian-optimal
+        centered grid (same grid as STEQuantizer in base_linear.py).
+
+        QMC via antithetic pairing across consecutive optimizer steps: step 2k
+        draws u from a generator seeded by (pair_id, param), step 2k+1 reuses the
+        SAME u flipped to 1-u. With momentum=0.95 consecutive NS outputs are
+        strongly correlated, so the linear SR-error terms approximately cancel
+        pairwise along the weight trajectory (exact cancellation would require
+        identical inputs across the pair, as in weight-quantizer antithetics).
+        """
+        n_levels = 2 ** self.sr_bits
+        scale = (
+            OPTIMAL_GAUSSIAN_SCALES[self.sr_bits]
+            * torch.sqrt(torch.mean(x.float() ** 2, dim=-1, keepdim=True))
+            + 1e-8
+        )
+        step_sz = 2 * scale / (n_levels - 1)
+        r = torch.clamp(x.float(), -scale, scale) / step_sz + 0.5
+
+        if self.sr_qmc:
+            pair_id, parity = self._sr_step_cnt // 2, self._sr_step_cnt % 2
+            g = torch.Generator(device=x.device)
+            g.manual_seed(((pair_id * _SEED_MIX) ^ param_seed) & 0x7FFFFFFF)
+            u = torch.rand(x.shape, generator=g, device=x.device, dtype=torch.float32)
+            if parity == 1:
+                u = 1.0 - u
+        else:
+            u = torch.rand_like(r)
+
+        # centered grid indices q = round(x/step + 1/2) live in
+        # [-(n/2 - 1), n/2], NOT [0, n-1] (that clamp collapses all negatives)
+        q = torch.floor(r + u).clamp(-(n_levels // 2 - 1), n_levels // 2)
+        xq = q * step_sz - step_sz / 2
+        return xq.to(x.dtype)
 
     def adjust_lr_for_muon(self, lr, param_shape):
         A, B = param_shape[:2]
@@ -153,6 +220,10 @@ class Muon(torch.optim.Optimizer):
                     g = buf
                 u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
 
+                # NS-then-round: stochastically round the orthogonalized update
+                if self.sr_mode == "update":
+                    u = self._qmc_sr_round(u, state["sr_param_seed"])
+
                 # scale update
                 adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
 
@@ -161,6 +232,10 @@ class Muon(torch.optim.Optimizer):
 
                 # apply update
                 p.data.add_(u, alpha=-adjusted_lr)
+
+                # alternative: round the master weights after the update
+                if self.sr_mode == "weight":
+                    p.data.copy_(self._qmc_sr_round(p.data, state["sr_param_seed"]))
 
             ############################
             #       AdamW backup       #
@@ -195,5 +270,8 @@ class Muon(torch.optim.Optimizer):
                 scale = bias_correction1 / bias_correction2**0.5
                 p.data.mul_(1 - lr * weight_decay)
                 p.data.add_(g, alpha=-lr / scale)
+
+        # advance the QMC/antithetic sequence once per optimizer step
+        self._sr_step_cnt += 1
 
         return loss

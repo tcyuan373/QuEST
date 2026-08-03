@@ -25,6 +25,16 @@ from .utils import (
 )
 
 
+def set_sr_step(model, step, micro):
+    """Broadcast the current (optimizer step, micro-step) into any quantizer that
+    consumes it for QMC / antithetic stochastic rounding (e.g. QMCSRSTEQuantizer).
+    No-op for quantizers that don't expose the buffers."""
+    for m in model.modules():
+        if hasattr(m, "_sr_micro"):
+            m._sr_micro.fill_(int(micro))
+            m._sr_step.fill_(int(step))
+
+
 def train(
     model,
     opt,
@@ -186,6 +196,7 @@ def train(
         # Train model
         t_start = time.perf_counter_ns()
         for microstep_idx in range(cfg.acc_steps):  # gradient accumulation
+            set_sr_step(model, curr_iter, microstep_idx)
             x, y = get_batch(train_reader, device=cfg.device)
             with type_ctx:
                 with distributed_backend.get_context_for_microstep_forward(

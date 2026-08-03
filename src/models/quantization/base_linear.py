@@ -1407,6 +1407,172 @@ class PartialRowwiseSRSTEQuantizer(STEQuantizer):
         else:
             return x + (xq - x).detach()
 
+class QMCSRSTEQuantizer(STEQuantizer):
+    """
+    Quasi-Monte-Carlo stochastic rounding via ANTITHETIC sampling across the
+    gradient-accumulation micro-steps of a single optimizer step.
+
+    Standard SR draws an iid uniform u ~ U(0,1) per element and rounds
+    floor(r + u). Over the acc_steps micro-forwards that make up one optimizer
+    update, those draws are independent, so the SR error in the accumulated
+    gradient shrinks only as O(1/sqrt(acc_steps)).
+
+    Here we pair the micro-steps: (0,1), (2,3), ... share one draw u, where the
+    even member uses u and the odd member uses its antithetic partner 1 - u.
+    Because the weight tensor is IDENTICAL across micro-steps within an optimizer
+    step, floor(r + u) and floor(r + (1 - u)) are negatively correlated, so the
+    linear SR-error term cancels in the accumulated gradient that Muon then
+    orthogonalizes -- lower-variance updates over the momentum window.
+
+    The draw is reconstructed deterministically from (optimizer_step, pair_id)
+    rather than cached across calls, so no Python state is mutated between the
+    (possibly compiled) forward passes. The train loop must call
+    set_sr_step(model, step, micro) before each micro-forward.
+
+    NOTE: the antithetic cancellation is exact only for the WEIGHT quantizer
+    (same tensor every micro-step). Applied to activations it stays unbiased but
+    the pairing is not a true antithetic pair, so expect little variance benefit
+    there.
+    """
+
+    # Knuth multiplicative hash constant, for mixing (step, pair_id) into a seed.
+    _SEED_MIX = 2654435761
+    # counts constructed instances; construction order is deterministic across
+    # DDP ranks and restarts, so per-instance seeds stay rank-consistent.
+    _instance_counter = 0
+
+    def __init__(self, bits=4, centered=True, eval_deterministic=True, qmc=True):
+        super().__init__(bits, centered)
+        self.eval_deterministic = eval_deterministic
+        # qmc=False falls back to plain iid SR noise (ablation arm); grid and
+        # STE behavior stay identical, only the noise source changes.
+        self.qmc = qmc
+        # decorrelate the noise streams of different layers: without this every
+        # instance would draw the IDENTICAL u tensor each micro-step, coupling
+        # rounding errors across all same-shape layers.
+        QMCSRSTEQuantizer._instance_counter += 1
+        self._sr_instance_seed = (
+            QMCSRSTEQuantizer._instance_counter * 0x9E3779B1
+        ) & 0x7FFFFFFF
+        # position within the current optimizer step, broadcast from the loop.
+        self.register_buffer(
+            "_sr_micro", torch.zeros((), dtype=torch.long), persistent=False
+        )
+        self.register_buffer(
+            "_sr_step", torch.zeros((), dtype=torch.long), persistent=False
+        )
+
+    def _antithetic_u(self, r):
+        # always draw in float32: bf16 uniforms would give the SR probabilities
+        # only 2^-8 resolution
+        if not self.qmc:
+            return torch.rand_like(r, dtype=torch.float32)
+        # .item() forces a host sync (a graph break under torch.compile) but is
+        # correct; the value is read fresh from the buffer each forward.
+        micro = int(self._sr_micro.item())
+        step = int(self._sr_step.item())
+        pair_id = micro // 2
+        parity = micro % 2
+
+        g = torch.Generator(device=r.device)
+        g.manual_seed(
+            ((step * self._SEED_MIX + pair_id) ^ self._sr_instance_seed)
+            & 0x7FFFFFFF
+        )
+        u = torch.rand(r.shape, generator=g, device=r.device, dtype=torch.float32)
+        if parity == 1:
+            u = 1.0 - u
+        return u
+
+    def forward(self, x):
+        if not self.training and self.eval_deterministic:
+            return super().forward(x)
+
+        scale = (
+            OPTIMAL_GAUSSIAN_SCALES[self.bits]
+            * torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True))
+            + 1e-8
+        )
+
+        if self.centered:
+            step_sz = 2 * scale / (self.n_levels - 1)
+            x_clip = torch.clamp(x, -scale, scale)
+            r = x_clip / step_sz + 0.5
+            # index range of round(x/step + 1/2) on the centered grid is
+            # [-(n/2 - 1), n/2], NOT [0, n-1] (that would collapse negatives)
+            qmin, qmax = -(self.n_levels // 2 - 1), float(self.n_levels // 2)
+        else:
+            step_sz = 2 * scale / self.n_levels
+            x_clip = torch.clamp(
+                x, -scale * (self.n_levels - 2) / self.n_levels, scale
+            )
+            r = x_clip / step_sz
+            qmin, qmax = -(self.n_levels // 2), float(self.n_levels // 2)
+
+        with torch.no_grad():
+            u = self._antithetic_u(r)
+            # index arithmetic in float32 (u is fp32; r may be lower precision)
+            q = torch.floor(r.to(torch.float32) + u).clamp(qmin, qmax).to(r.dtype)
+            if self.centered:
+                xq = q * step_sz - step_sz / 2
+            else:
+                xq = q * step_sz
+
+        return x + (xq - x).detach()
+
+
+class QMCSRFP4Quantizer(QMCSRSTEQuantizer):
+    """Stochastic rounding on the NON-UNIFORM FP4 level grid (same level table
+    as FP4STEQuantizer), with the same antithetic/iid noise machinery as
+    QMCSRSTEQuantizer. Completes the {uniform, FP4} x {det, SR} matrix.
+
+    SR on a non-uniform grid: for x between adjacent levels l <= x <= h, round
+    up to h with probability (x - l) / (h - l), else down to l. This keeps
+    E[xq] = x for any in-range x regardless of level spacing; values beyond the
+    outermost levels saturate deterministically.
+
+    Eval mode falls back to deterministic nearest-level rounding, which matches
+    FP4STEQuantizer exactly.
+    """
+
+    # unique sorted FP4 levels (the FP4_LEVELS table minus the duplicated 0.0)
+    FP4_LEVELS_UNIQUE = [
+        -2.92247856, -1.94831904, -1.46123928, -0.97415952, -0.73061964,
+        -0.48707976, -0.24353988, 0.0, 0.24353988, 0.48707976, 0.73061964,
+        0.97415952, 1.46123928, 1.94831904, 2.92247856,
+    ]
+
+    def __init__(self, eval_deterministic=True, qmc=True, **kwargs):
+        super().__init__(
+            bits=4, centered=True, eval_deterministic=eval_deterministic, qmc=qmc
+        )
+        self.register_buffer(
+            "levels", torch.tensor(self.FP4_LEVELS_UNIQUE, dtype=torch.float32)
+        )
+
+    def _nearest_level(self, xn):
+        idx = torch.argmin(torch.abs(xn.unsqueeze(-1) - self.levels), dim=-1)
+        return self.levels[idx]
+
+    def forward(self, x):
+        std = torch.sqrt(torch.mean(x.float() ** 2, dim=-1, keepdim=True)) + 1e-8
+        xn = (x.float() / std).clamp(self.levels[0], self.levels[-1])
+
+        with torch.no_grad():
+            if not self.training and self.eval_deterministic:
+                q = self._nearest_level(xn)
+            else:
+                idx_hi = torch.searchsorted(self.levels, xn.contiguous()).clamp(
+                    1, self.levels.numel() - 1
+                )
+                lo = self.levels[idx_hi - 1]
+                hi = self.levels[idx_hi]
+                p = ((xn - lo) / (hi - lo)).clamp(0.0, 1.0)
+                u = self._antithetic_u(p)
+                q = torch.where(u < p, hi, lo)
+            xq = (q * std).to(x.dtype)
+
+        return x + (xq - x).detach()
 
 
 class LSQQuantizer(nn.Module):
@@ -1597,6 +1763,8 @@ QUANTIZER_CLASSES = {
     "SRSTEQuantizer": SR2STEQuantizer,
     "PartialSRSTEQuantizer": PartialSRSTEQuantizer,
     "PartialRowwiseSRSTEQuantizer": PartialRowwiseSRSTEQuantizer,
+    "QMCSRSTEQuantizer": QMCSRSTEQuantizer,
+    "QMCSRFP4Quantizer": QMCSRFP4Quantizer,
 }
 
 
