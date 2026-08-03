@@ -12,7 +12,10 @@ def get_redpajama_data(datasets_dir, num_proc=40):
     RPJ_DATA_PATH = os.path.join(datasets_dir, "redpajama1Tsample/")
     if not os.path.exists(os.path.join(RPJ_DATA_PATH, "train.bin")):
         os.makedirs(RPJ_DATA_PATH, exist_ok=True)
-        dataset = load_dataset("togethercomputer/RedPajama-Data-1T-Sample")
+        # togethercomputer/RedPajama-Data-1T-Sample was removed from the Hub
+        # (401, 2026-08); this is the most-used parquet mirror of it, loadable
+        # by datasets>=3 (the original relied on a now-unsupported script).
+        dataset = load_dataset("liang2kl/RedPajama-Data-1T-Sample-Backup")
 
         split_dataset = dataset["train"].train_test_split(
             test_size=0.0005, seed=2357, shuffle=True

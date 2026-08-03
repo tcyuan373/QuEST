@@ -5,7 +5,18 @@ from datasets import load_dataset
 import os
 
 
-hf_tknzr = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+# Loaded lazily inside get_c4_data so that merely importing this module (which
+# data/utils.py does unconditionally) does not require the gated Llama-2 repo /
+# network access. Datasets that ship prebuilt .bin files (e.g. slimpajama) never
+# touch this.
+_hf_tknzr = None
+
+
+def _get_tokenizer():
+    global _hf_tknzr
+    if _hf_tknzr is None:
+        _hf_tknzr = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+    return _hf_tknzr
 
 
 def get_c4_data(datasets_dir, num_proc=40):
@@ -18,6 +29,8 @@ def get_c4_data(datasets_dir, num_proc=40):
             test_size=0.0005, seed=2357, shuffle=True
         )
         split_dataset["val"] = split_dataset.pop("test")
+
+        hf_tknzr = _get_tokenizer()
 
         def process(example):
             ids = hf_tknzr.encode(
