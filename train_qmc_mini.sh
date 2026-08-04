@@ -21,6 +21,11 @@ case ${ARM} in
   qmcfp4)  W_QUANT="QMCSRFP4Quantizer"; W_QUANT_KWARGS='{}';            MUON_SR_MODE="none" ;;
   iidfp4)  W_QUANT="QMCSRFP4Quantizer"; W_QUANT_KWARGS='{"qmc": false}'; MUON_SR_MODE="none" ;;
   qmcfp4full) W_QUANT="QMCSRFP4Quantizer"; W_QUANT_KWARGS='{}';         MUON_SR_MODE="update" ;;
+  qmctrust)   W_QUANT="QMCSRTrustQuantizer";        W_QUANT_KWARGS='{}'; MUON_SR_MODE="none" ;;
+  qmchad)     W_QUANT="HadamardQMCSRQuantizer";     W_QUANT_KWARGS='{}'; MUON_SR_MODE="none" ;;
+  qmchadtrust) W_QUANT="HadamardQMCSRTrustQuantizer"; W_QUANT_KWARGS='{}'; MUON_SR_MODE="none" ;;
+  queststyle) W_QUANT="HalfHadamardQMCSRTrustQuantizer"; W_QUANT_KWARGS='{}'; MUON_SR_MODE="none"; A_QUANT_OVERRIDE="HalfHadamardTrustQuantizer" ;;
+  questbase)  W_QUANT="HalfHadamardTrustQuantizer"; W_QUANT_KWARGS='{}'; MUON_SR_MODE="none"; A_QUANT_OVERRIDE="HalfHadamardTrustQuantizer" ;;
   *) echo "unknown ARM=${ARM}"; exit 1 ;;
 esac
 echo "=== ARM=${ARM}: W_QUANT=${W_QUANT} kwargs=${W_QUANT_KWARGS} muon-sr=${MUON_SR_MODE} ==="
@@ -73,7 +78,7 @@ else
   CKPT_INTERVAL=100000
   RUN_SUFFIX="job${SLURM_JOB_ID:-local}_r${SLURM_RESTART_COUNT:-0}"
 fi
-export A_QUANT="STEQuantizer"      # activations deterministic in every arm
+export A_QUANT="${A_QUANT_OVERRIDE:-STEQuantizer}"  # deterministic STE unless arm needs HalfHadamard pairing
 
 export ITERATIONS=$((TOKENS / (BATCH_SIZE * ACC_STEPS * SEQUENCE_LENGTH)))
 # hyperparam-sweep knobs (defaults reproduce all prior runs)

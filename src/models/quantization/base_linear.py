@@ -1484,32 +1484,30 @@ class QMCSRSTEQuantizer(STEQuantizer):
             u = 1.0 - u
         return u
 
-    def forward(self, x):
-        if not self.training and self.eval_deterministic:
-            return super().forward(x)
-
-        scale = (
-            OPTIMAL_GAUSSIAN_SCALES[self.bits]
-            * torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True))
-            + 1e-8
-        )
-
-        if self.centered:
-            step_sz = 2 * scale / (self.n_levels - 1)
-            x_clip = torch.clamp(x, -scale, scale)
-            r = x_clip / step_sz + 0.5
-            # index range of round(x/step + 1/2) on the centered grid is
-            # [-(n/2 - 1), n/2], NOT [0, n-1] (that would collapse negatives)
-            qmin, qmax = -(self.n_levels // 2 - 1), float(self.n_levels // 2)
-        else:
-            step_sz = 2 * scale / self.n_levels
-            x_clip = torch.clamp(
-                x, -scale * (self.n_levels - 2) / self.n_levels, scale
-            )
-            r = x_clip / step_sz
-            qmin, qmax = -(self.n_levels // 2), float(self.n_levels // 2)
-
+    def _sr_values(self, x):
+        """(QMC-)SR quantized values of x on the centered uniform grid.
+        Pure value computation (no STE composition); runs under no_grad."""
         with torch.no_grad():
+            scale = (
+                OPTIMAL_GAUSSIAN_SCALES[self.bits]
+                * torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True))
+                + 1e-8
+            )
+            if self.centered:
+                step_sz = 2 * scale / (self.n_levels - 1)
+                x_clip = torch.clamp(x, -scale, scale)
+                r = x_clip / step_sz + 0.5
+                # index range of round(x/step + 1/2) on the centered grid is
+                # [-(n/2 - 1), n/2], NOT [0, n-1] (that would collapse negatives)
+                qmin, qmax = -(self.n_levels // 2 - 1), float(self.n_levels // 2)
+            else:
+                step_sz = 2 * scale / self.n_levels
+                x_clip = torch.clamp(
+                    x, -scale * (self.n_levels - 2) / self.n_levels, scale
+                )
+                r = x_clip / step_sz
+                qmin, qmax = -(self.n_levels // 2), float(self.n_levels // 2)
+
             u = self._antithetic_u(r)
             # index arithmetic in float32 (u is fp32; r may be lower precision)
             q = torch.floor(r.to(torch.float32) + u).clamp(qmin, qmax).to(r.dtype)
@@ -1517,7 +1515,25 @@ class QMCSRSTEQuantizer(STEQuantizer):
                 xq = q * step_sz - step_sz / 2
             else:
                 xq = q * step_sz
+        return xq
 
+    def _det_values(self, x):
+        """Deterministic RTN values on the same grid (for eval / trust masks)."""
+        with torch.no_grad():
+            scale = (
+                OPTIMAL_GAUSSIAN_SCALES[self.bits]
+                * torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True))
+                + 1e-8
+            )
+            step_sz = 2 * scale / (self.n_levels - 1)
+            x_clip = torch.clamp(x, -scale, scale)
+            xq = torch.round(x_clip / step_sz + 0.5) * step_sz - step_sz / 2
+        return xq
+
+    def forward(self, x):
+        if not self.training and self.eval_deterministic:
+            return super().forward(x)
+        xq = self._sr_values(x)
         return x + (xq - x).detach()
 
 
@@ -1573,6 +1589,146 @@ class QMCSRFP4Quantizer(QMCSRSTEQuantizer):
             xq = (q * std).to(x.dtype)
 
         return x + (xq - x).detach()
+
+
+class QMCSRTrustQuantizer(QMCSRSTEQuantizer):
+    """QuEST's trust gradient estimator composed with (QMC-)SR forward values.
+
+    The trust mask gates the STE gradient where quantization error is small.
+    Under SR the per-draw error is random, so a naive mask would be stochastic
+    and correlated with the rounding noise (breaking the antithetic pair
+    cancellation on the gradient path). Fix: compute the mask from the
+    DETERMINISTIC RTN error |RTN(x) - x| <= trust * std -- identical across the
+    antithetic pair -- while the forward VALUE uses the (QMC-)SR draw.
+    """
+
+    def __init__(self, bits=4, centered=True, eval_deterministic=True, qmc=True,
+                 trust=None):
+        super().__init__(bits, centered, eval_deterministic, qmc)
+        if trust is None:
+            trust = OPTIMAL_GAUSSIAN_SCALES[self.bits] / (self.n_levels - 1)
+        self.trust = trust
+
+    def _trust_mask(self, x):
+        with torch.no_grad():
+            std = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True)) + 1e-8
+            mask = (torch.abs(self._det_values(x) - x) <= std * self.trust).to(
+                x.dtype
+            )
+        return mask
+
+    def forward(self, x):
+        mask = self._trust_mask(x)
+        if not self.training and self.eval_deterministic:
+            xq = self._det_values(x)
+        else:
+            xq = self._sr_values(x)
+        grad_flow = x * mask
+        return grad_flow + (xq - grad_flow).detach()
+
+
+class _HadamardRotationMixin:
+    """Lazy block-diagonal 128-Hadamard rotation, same pattern as the QuEST
+    Hadamard quantizer family."""
+
+    aux_matrix = hadamard_transform(
+        torch.eye(128, dtype=torch.bfloat16, device="cuda"), scale=2 ** (-7 / 2)
+    )
+
+    def _rotation(self, x):
+        if getattr(self, "matrix", None) is None:
+            self.matrix = torch.block_diag(
+                *[self.aux_matrix.to(x.device).to(x.dtype)] * (x.shape[-1] // 128),
+            )
+        return self.matrix
+
+
+class HadamardQMCSRQuantizer(_HadamardRotationMixin, QMCSRSTEQuantizer):
+    """FULL Hadamard rotation around (QMC-)SR: rotate -> SR -> rotate back.
+
+    Drop-in weight quantizer for any activation quantizer (the rotation is
+    undone, unlike the Half variants which require BOTH sides rotated).
+    Rotation is fixed, so W identical across micro-steps => antithetic pair
+    cancellation is preserved through the linear rotate-back.
+    """
+
+    def __init__(self, bits=4, eval_deterministic=True, qmc=True):
+        super().__init__(bits, True, eval_deterministic, qmc)
+        self.matrix = None
+
+    def forward(self, x):
+        M = self._rotation(x)
+        x_had = x @ M
+        if not self.training and self.eval_deterministic:
+            xq_had = self._det_values(x_had)
+        else:
+            xq_had = self._sr_values(x_had)
+        with torch.no_grad():
+            xq = xq_had @ M.T
+        return x + (xq - x).detach()
+
+
+class HalfHadamardQMCSRQuantizer(_HadamardRotationMixin, QMCSRSTEQuantizer):
+    """HALF Hadamard (no rotate-back) + (QMC-)SR, for use when the activation
+    quantizer is also a HalfHadamard* class (the two H's cancel in the matmul).
+    """
+
+    def __init__(self, bits=4, eval_deterministic=True, qmc=True):
+        super().__init__(bits, True, eval_deterministic, qmc)
+        self.matrix = None
+
+    def forward(self, x):
+        M = self._rotation(x)
+        x_had = x @ M
+        if not self.training and self.eval_deterministic:
+            xq_had = self._det_values(x_had)
+        else:
+            xq_had = self._sr_values(x_had)
+        return x_had + (xq_had - x_had).detach()
+
+
+class HadamardQMCSRTrustQuantizer(_HadamardRotationMixin, QMCSRTrustQuantizer):
+    """Full QuEST-style pipeline with SR values: FULL Hadamard rotation,
+    deterministic trust mask in the rotated domain, (QMC-)SR forward values,
+    rotate back. Drop-in weight quantizer for any activation quantizer."""
+
+    def __init__(self, bits=4, eval_deterministic=True, qmc=True, trust=None):
+        super().__init__(bits, True, eval_deterministic, qmc, trust)
+        self.matrix = None
+
+    def forward(self, x):
+        M = self._rotation(x)
+        x_had = x @ M
+        mask = self._trust_mask(x_had)
+        if not self.training and self.eval_deterministic:
+            xq_had = self._det_values(x_had)
+        else:
+            xq_had = self._sr_values(x_had)
+        with torch.no_grad():
+            xq = xq_had @ M.T
+        grad_flow = (x_had * mask) @ M.T
+        return grad_flow + (xq - grad_flow).detach()
+
+
+class HalfHadamardQMCSRTrustQuantizer(_HadamardRotationMixin, QMCSRTrustQuantizer):
+    """Half-Hadamard + deterministic trust mask + (QMC-)SR values, mirroring
+    HalfHadamardTrustQuantizer with SR swapped in. Pair with a HalfHadamard*
+    activation quantizer."""
+
+    def __init__(self, bits=4, eval_deterministic=True, qmc=True, trust=None):
+        super().__init__(bits, True, eval_deterministic, qmc, trust)
+        self.matrix = None
+
+    def forward(self, x):
+        M = self._rotation(x)
+        x_had = x @ M
+        mask = self._trust_mask(x_had)
+        if not self.training and self.eval_deterministic:
+            xq_had = self._det_values(x_had)
+        else:
+            xq_had = self._sr_values(x_had)
+        grad_flow = x_had * mask
+        return grad_flow + (xq_had - grad_flow).detach()
 
 
 class LSQQuantizer(nn.Module):
@@ -1765,6 +1921,11 @@ QUANTIZER_CLASSES = {
     "PartialRowwiseSRSTEQuantizer": PartialRowwiseSRSTEQuantizer,
     "QMCSRSTEQuantizer": QMCSRSTEQuantizer,
     "QMCSRFP4Quantizer": QMCSRFP4Quantizer,
+    "QMCSRTrustQuantizer": QMCSRTrustQuantizer,
+    "HadamardQMCSRQuantizer": HadamardQMCSRQuantizer,
+    "HalfHadamardQMCSRQuantizer": HalfHadamardQMCSRQuantizer,
+    "HadamardQMCSRTrustQuantizer": HadamardQMCSRTrustQuantizer,
+    "HalfHadamardQMCSRTrustQuantizer": HalfHadamardQMCSRTrustQuantizer,
 }
 
 

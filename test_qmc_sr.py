@@ -163,6 +163,90 @@ xg2 = x.clone().requires_grad_(True)
 qf(xg2).sum().backward()
 check("fp4-sr STE gradient == 1", torch.equal(xg2.grad, torch.ones_like(xg2)))
 
+# --- 12. Trust + QMC-SR (deterministic mask, stochastic values) --------------
+from models.quantization.base_linear import (
+    QMCSRTrustQuantizer, HadamardQMCSRQuantizer, HalfHadamardQMCSRQuantizer,
+    HadamardQMCSRTrustQuantizer, HalfHadamardQMCSRTrustQuantizer,
+    TrustQuantizer, HalfHadamardTrustQuantizer, HadamardTrustQuantizer,
+)
+
+qt = QMCSRTrustQuantizer().to(dev).train()
+qt._sr_step.fill_(3); qt._sr_micro.fill_(0)
+y0 = qt(x); qt._sr_micro.fill_(1); y1 = qt(x)
+# mask must be identical across the antithetic pair: gradient of both draws equal
+xg = x.clone().requires_grad_(True)
+qt._sr_micro.fill_(0); qt(xg).sum().backward(); g0 = xg.grad.clone()
+xg.grad = None
+qt._sr_micro.fill_(1); qt(xg).sum().backward(); g1 = xg.grad.clone()
+check("trust: mask deterministic across pair (grads equal)", torch.equal(g0, g1))
+check("trust: grad is 0/1 mask", set(torch.unique(g0).tolist()) <= {0.0, 1.0})
+# values still unbiased & antithetic on the value path
+pair_err = ((y0.detach() + y1.detach()) / 2 - x * (g0 == g0)).abs()  # vs x
+sing_err = (y0.detach() - x).abs()
+check("trust: antithetic value cancellation", pair_err.mean() < 0.6 * sing_err.mean(),
+      f"pair {pair_err.mean():.4f} vs single {sing_err.mean():.4f}")
+qt.eval()
+te = TrustQuantizer().to(dev)
+check("trust: eval == deterministic TrustQuantizer values",
+      torch.allclose(qt(x).detach(), te(x).detach(), atol=1e-5))
+
+# --- 13. Hadamard QMC-SR (full rotation) --------------------------------------
+qh = HadamardQMCSRQuantizer().to(dev).train()
+acc = torch.zeros_like(x)
+N = 300
+for t in range(N):
+    qh._sr_step.fill_(t); qh._sr_micro.fill_(0)
+    acc += qh(x).detach()
+# SR is unbiased on the CLIPPED rotated value; rotation back spreads the
+# (deterministic) clip saturation across coords, so compare against the
+# clipped reference, not raw x.
+with torch.no_grad():
+    Mh = qh._rotation(x)
+    xh = x @ Mh
+    sc = 2.513930578568423 * torch.sqrt(torch.mean(xh**2, dim=-1, keepdim=True)) + 1e-8
+    ref = torch.clamp(xh, -sc, sc) @ Mh.T
+bias = (acc / N - ref).abs().mean().item()
+serr = (qh(x).detach() - ref).abs().mean().item()
+check("hadamard-full: unbiased vs clipped reference", bias < 3 * serr / N**0.5 + 5e-3,
+      f"bias={bias:.5f} single={serr:.5f}")
+qh._sr_step.fill_(7); qh._sr_micro.fill_(0); h0 = qh(x).detach()
+qh._sr_micro.fill_(1); h1 = qh(x).detach()
+check("hadamard-full: antithetic pair cancels",
+      ((h0 + h1) / 2 - x).abs().mean() < 0.6 * (h0 - x).abs().mean())
+xg3 = x.clone().requires_grad_(True)
+qh(xg3).sum().backward()
+check("hadamard-full: STE gradient == 1", torch.allclose(xg3.grad, torch.ones_like(xg3), atol=1e-4))
+
+# --- 14. Half-Hadamard QMC-SR: rotated-domain output, product preserved -------
+qhh = HalfHadamardQMCSRQuantizer().to(dev).eval()
+M = qhh._rotation(x)
+ref = x @ M
+check("half-hadamard: eval outputs live in rotated domain",
+      torch.allclose(qhh(x).detach(), STEQuantizer().to(dev)(ref).detach(), atol=1e-4))
+# both-sides rotation cancels in the matmul (weights x activations)
+wq = HalfHadamardQMCSRQuantizer().to(dev).eval()
+aq_rot = HalfHadamardTrustQuantizer().to(dev).eval()
+a = torch.randn(64, 512, device=dev)
+w = torch.randn(256, 512, device=dev)
+prod_rot = aq_rot(a).detach() @ wq(w).detach().T
+prod_ref = (a @ w.T)
+rel = (prod_rot - prod_ref).abs().mean() / prod_ref.abs().mean()
+check("half-hadamard pair: rotations cancel in matmul (quant-level error only)",
+      rel.item() < 0.2, f"rel err {rel.item():.3f}")
+
+# --- 15. QuEST-style combos construct & train-step cleanly --------------------
+for cls in (HadamardQMCSRTrustQuantizer, HalfHadamardQMCSRTrustQuantizer):
+    q = cls().to(dev).train()
+    q._sr_step.fill_(1); q._sr_micro.fill_(0)
+    xg4 = x.clone().requires_grad_(True)
+    q(xg4).sum().backward()
+    check(f"{cls.__name__}: fwd/bwd OK, grad in rotated-mask family", xg4.grad is not None)
+q = HadamardQMCSRTrustQuantizer().to(dev)
+q.eval()
+ht = HadamardTrustQuantizer().to(dev)
+check("hadamard-trust-qmc: eval values == HadamardTrustQuantizer",
+      torch.allclose(q(x).detach(), ht(x).detach(), atol=1e-4))
+
 print()
 if FAILS:
     print("FAILED:", FAILS)
