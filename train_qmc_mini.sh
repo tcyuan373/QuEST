@@ -26,6 +26,8 @@ case ${ARM} in
   qmchadtrust) W_QUANT="HadamardQMCSRTrustQuantizer"; W_QUANT_KWARGS='{}'; MUON_SR_MODE="none" ;;
   queststyle) W_QUANT="HalfHadamardQMCSRTrustQuantizer"; W_QUANT_KWARGS='{}'; MUON_SR_MODE="none"; A_QUANT_OVERRIDE="HalfHadamardTrustQuantizer" ;;
   questbase)  W_QUANT="HalfHadamardTrustQuantizer"; W_QUANT_KWARGS='{}'; MUON_SR_MODE="none"; A_QUANT_OVERRIDE="HalfHadamardTrustQuantizer" ;;
+  qmccurv)    W_QUANT="CurvatureGatedQMCSRQuantizer"; W_QUANT_KWARGS='{}'; MUON_SR_MODE="none" ;;
+  qmccurvinv) W_QUANT="CurvatureGatedQMCSRQuantizer"; W_QUANT_KWARGS='{"gate_mode": "sr_top"}'; MUON_SR_MODE="none" ;;
   *) echo "unknown ARM=${ARM}"; exit 1 ;;
 esac
 echo "=== ARM=${ARM}: W_QUANT=${W_QUANT} kwargs=${W_QUANT_KWARGS} muon-sr=${MUON_SR_MODE} ==="

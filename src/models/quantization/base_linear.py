@@ -1731,6 +1731,76 @@ class HalfHadamardQMCSRTrustQuantizer(_HadamardRotationMixin, QMCSRTrustQuantize
         return grad_flow + (xq_had - grad_flow).detach()
 
 
+class CurvatureGatedQMCSRQuantizer(QMCSRSTEQuantizer):
+    """Curvature-gated rounding: mix deterministic RTN and (QMC-)SR per weight
+    COLUMN, gated by an online layer-curvature proxy.
+
+    For the layerwise objective ||WX - W_hat X||^2 the Hessian diagonal for
+    input channel j is E[x_j^2]. QuantizedLinear feeds the (quantized) layer
+    input via the optional observe_input() hook; we keep an EMA of per-channel
+    E[x_j^2] as the sensitivity h_j. The top det_frac fraction of columns by
+    h_j round DETERMINISTICALLY (gate_mode="det_top": protect sensitive
+    coordinates from rounding noise) or, under gate_mode="sr_top", the inverse
+    hypothesis (dither the sensitive ones). Both value sets live on the same
+    per-row grid, so mixing is consistent.
+
+    QMC note: the gate is frozen at micro-step 0 of each optimizer step and
+    reused for the whole accumulation window, so the antithetic pairs stay
+    aligned coordinate-wise. Until curvature statistics exist, behaves as
+    plain (QMC-)SR. Single-process training assumed for the curvature EMA
+    (ranks would need an all-reduce to stay identical under DDP).
+    """
+
+    def __init__(self, bits=4, centered=True, eval_deterministic=True, qmc=True,
+                 det_frac=0.1, gate_mode="det_top", ema=0.99):
+        super().__init__(bits, centered, eval_deterministic, qmc)
+        assert gate_mode in ("det_top", "sr_top"), gate_mode
+        self.det_frac = float(det_frac)
+        self.gate_mode = gate_mode
+        self.ema = float(ema)
+        self.curv = None          # (in_features,) EMA of E[x_j^2]
+        self._gate_cache = None   # frozen per optimizer step
+        self._gate_step = -1
+
+    @torch.no_grad()
+    def observe_input(self, x):
+        """Called by QuantizedLinear with the (quantized) layer input."""
+        if not self.training:
+            return
+        h = x.float().pow(2).reshape(-1, x.shape[-1]).mean(dim=0)
+        if self.curv is None:
+            self.curv = h
+        else:
+            self.curv.mul_(self.ema).add_(h, alpha=1.0 - self.ema)
+
+    @torch.no_grad()
+    def _gate(self, x):
+        """(1, in_features) bool mask: True where rounding is DETERMINISTIC."""
+        if self.curv is None or self.det_frac <= 0.0:
+            return None
+        step = int(self._sr_step.item())
+        micro = int(self._sr_micro.item())
+        if self._gate_cache is None or micro == 0 and step != self._gate_step:
+            n = self.curv.numel()
+            k = max(1, int(round(self.det_frac * n)))
+            thresh = torch.topk(self.curv, k).values.min()
+            top = (self.curv >= thresh)
+            det = top if self.gate_mode == "det_top" else ~top
+            self._gate_cache = det.unsqueeze(0)
+            self._gate_step = step
+        return self._gate_cache
+
+    def forward(self, x):
+        if not self.training and self.eval_deterministic:
+            return STEQuantizer.forward(self, x)
+        with torch.no_grad():
+            xq = self._sr_values(x)
+            gate = self._gate(x)
+            if gate is not None:
+                xq = torch.where(gate.to(x.device), self._det_values(x), xq)
+        return x + (xq - x).detach()
+
+
 class LSQQuantizer(nn.Module):
     """
     Implementation of LSQ quantizer from https://arxiv.org/abs/1902.08153
@@ -1926,6 +1996,7 @@ QUANTIZER_CLASSES = {
     "HalfHadamardQMCSRQuantizer": HalfHadamardQMCSRQuantizer,
     "HadamardQMCSRTrustQuantizer": HadamardQMCSRTrustQuantizer,
     "HalfHadamardQMCSRTrustQuantizer": HalfHadamardQMCSRTrustQuantizer,
+    "CurvatureGatedQMCSRQuantizer": CurvatureGatedQMCSRQuantizer,
 }
 
 
@@ -1948,5 +2019,8 @@ class QuantizedLinear(nn.Linear):
 
     def forward(self, x):
         x = self.activation_quantizer(x)
+        # optional curvature-observation hook (no-op for quantizers without it)
+        if hasattr(self.weight_quantizer, "observe_input"):
+            self.weight_quantizer.observe_input(x)
         w = self.weight_quantizer(self.weight)
         return F.linear(x, w, self.bias)

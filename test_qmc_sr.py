@@ -247,6 +247,52 @@ ht = HadamardTrustQuantizer().to(dev)
 check("hadamard-trust-qmc: eval values == HadamardTrustQuantizer",
       torch.allclose(q(x).detach(), ht(x).detach(), atol=1e-4))
 
+# --- 16. Curvature-gated QMC-SR -----------------------------------------------
+from models.quantization.base_linear import CurvatureGatedQMCSRQuantizer
+
+qc = CurvatureGatedQMCSRQuantizer(det_frac=0.25).to(dev).train()
+qc._sr_step.fill_(5); qc._sr_micro.fill_(0)
+# no curvature yet -> pure SR (matches QMCSRSTEQuantizer stream? same instance seeds differ;
+# just check it runs and is stochastic across steps)
+o1 = qc(x).detach(); qc._sr_step.fill_(6); o2 = qc(x).detach()
+check("curv: SR fallback before stats", not torch.equal(o1, o2))
+# feed synthetic activations with strong per-channel scale differences
+act = torch.randn(4096, 512, device=dev) * torch.linspace(0.1, 3.0, 512, device=dev)
+qc.observe_input(act)
+check("curv: stats recorded", qc.curv is not None and qc.curv.numel() == 512)
+top_true = torch.topk(act.pow(2).mean(0), int(0.25 * 512)).indices
+qc._sr_step.fill_(7); qc._sr_micro.fill_(0)
+det_gate = qc._gate(x)[0]
+overlap = det_gate[top_true].float().mean().item()
+check("curv: gate tracks true high-curvature channels", overlap > 0.95, f"overlap={overlap:.2f}")
+# det-gated columns: repeated draws identical (RTN); SR columns vary
+y1 = qc(x).detach(); qc._sr_micro.fill_(2); y2 = qc(x).detach()
+det_cols = det_gate.nonzero().squeeze(-1); sr_cols = (~det_gate).nonzero().squeeze(-1)
+check("curv: gated columns deterministic", torch.equal(y1[:, det_cols], y2[:, det_cols]))
+check("curv: ungated columns stochastic", not torch.equal(y1[:, sr_cols], y2[:, sr_cols]))
+# gate frozen within an optimizer step across micro-steps despite new stats
+qc._sr_micro.fill_(0); _ = qc(x)
+g_before = qc._gate(x).clone()
+qc.observe_input(torch.randn(4096, 512, device=dev) * torch.linspace(3.0, 0.1, 512, device=dev))
+qc._sr_micro.fill_(3)
+g_after = qc._gate(x)
+check("curv: gate frozen within optimizer step", torch.equal(g_before, g_after))
+# same grid: mixed values within +-scale, STE grad identity, eval == RTN
+xg5 = x.clone().requires_grad_(True)
+qc(xg5).sum().backward()
+check("curv: STE gradient == 1", torch.equal(xg5.grad, torch.ones_like(xg5)))
+qc.eval()
+check("curv: eval == deterministic STEQuantizer", torch.equal(qc(x), STEQuantizer().to(dev)(x)))
+# hook wiring through QuantizedLinear
+lin2 = QuantizedLinear(512, 128, weight_quantizer=CurvatureGatedQMCSRQuantizer()).to(dev).train()
+_ = lin2(torch.randn(8, 512, device=dev))
+check("curv: QuantizedLinear feeds observe_input", lin2.weight_quantizer.curv is not None)
+# sr_top mode inverts the gate
+qi2 = CurvatureGatedQMCSRQuantizer(det_frac=0.25, gate_mode="sr_top").to(dev).train()
+qi2.observe_input(act); qi2._sr_step.fill_(7); qi2._sr_micro.fill_(0)
+inv_gate = qi2._gate(x)[0]
+check("curv: sr_top inverts gate", torch.equal(inv_gate, ~det_gate))
+
 print()
 if FAILS:
     print("FAILED:", FAILS)
