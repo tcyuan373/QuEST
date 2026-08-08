@@ -26,14 +26,20 @@ case ${ARM} in
   qmchadtrust) W_QUANT="HadamardQMCSRTrustQuantizer"; W_QUANT_KWARGS='{}'; MUON_SR_MODE="none" ;;
   queststyle) W_QUANT="HalfHadamardQMCSRTrustQuantizer"; W_QUANT_KWARGS='{}'; MUON_SR_MODE="none"; A_QUANT_OVERRIDE="HalfHadamardTrustQuantizer" ;;
   questbase)  W_QUANT="HalfHadamardTrustQuantizer"; W_QUANT_KWARGS='{}'; MUON_SR_MODE="none"; A_QUANT_OVERRIDE="HalfHadamardTrustQuantizer" ;;
+  fp16)       W_QUANT="NoQuantizer"; W_QUANT_KWARGS='{}'; MUON_SR_MODE="none"; A_QUANT_OVERRIDE="NoQuantizer" ;;
   qmccurv)    W_QUANT="CurvatureGatedQMCSRQuantizer"; W_QUANT_KWARGS='{}'; MUON_SR_MODE="none" ;;
   qmccurvinv) W_QUANT="CurvatureGatedQMCSRQuantizer"; W_QUANT_KWARGS='{"gate_mode": "sr_top"}'; MUON_SR_MODE="none" ;;
   *) echo "unknown ARM=${ARM}"; exit 1 ;;
 esac
+# compose NS-then-round onto any arm (e.g. queststyle + MUON_SR_MODE_OVERRIDE=update SR_BITS=6)
+MUON_SR_MODE=${MUON_SR_MODE_OVERRIDE:-${MUON_SR_MODE}}
 echo "=== ARM=${ARM}: W_QUANT=${W_QUANT} kwargs=${W_QUANT_KWARGS} muon-sr=${MUON_SR_MODE} ==="
 
 export BATCH_SIZE=64
-export ACC_STEPS=8
+# ACC_STEPS sets the effective batch (BATCH_SIZE*ACC_STEPS): 8 -> 512 (our tier
+# protocol), 2 -> 128 (QuEST-paper protocol). OPT=adamw for the paper's optimizer.
+export ACC_STEPS=${ACC_STEPS:-8}
+export OPT=${OPT:-muon}
 export SEQUENCE_LENGTH=512
 export DATASET=${DATASET:-slimpajama}   # slimpajama | minipile | redpajama | ...
 # Seed study: SEED varies init/training RNG AND the data order (data-seed
@@ -82,6 +88,14 @@ else
 fi
 export A_QUANT="${A_QUANT_OVERRIDE:-STEQuantizer}"  # deterministic STE unless arm needs HalfHadamard pairing
 
+# Low-bit sweep: BITS sets weight AND activation quantizer bits (e.g. BITS=2 ->
+# W2A2). Unset = class default 4 with kwargs untouched, reproducing all prior runs.
+A_QUANT_KWARGS='{}'
+if [ -n "${BITS:-}" ]; then
+  W_QUANT_KWARGS=$(python -c "import json; d=json.loads('${W_QUANT_KWARGS}'); d['bits']=int('${BITS}'); print(json.dumps(d))")
+  A_QUANT_KWARGS="{\"bits\": ${BITS}}"
+fi
+
 export ITERATIONS=$((TOKENS / (BATCH_SIZE * ACC_STEPS * SEQUENCE_LENGTH)))
 # hyperparam-sweep knobs (defaults reproduce all prior runs)
 WARMUP_PCT=${WARMUP_PCT:-10}                 # warmup as %% of iterations
@@ -118,7 +132,8 @@ torchrun --master_port=${MASTER_PORT} --nproc_per_node=${NUM_GPUS} ./src/main.py
     --w-quant ${W_QUANT} \
     --w-quant-kwargs "${W_QUANT_KWARGS}" \
     --a-quant ${A_QUANT} \
-    --opt muon \
+    --a-quant-kwargs "${A_QUANT_KWARGS}" \
+    --opt ${OPT} \
     --muon-sr-mode ${MUON_SR_MODE} \
     --muon-sr-bits ${SR_BITS} \
     --muon-momentum ${MUON_MOMENTUM} \

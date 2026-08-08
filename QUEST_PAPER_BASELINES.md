@@ -1,10 +1,24 @@
 # QuEST paper baselines (from `for_plots/runs_for_scaling.json`, 104 runs)
 
-Original IST-DASLab runs behind the paper's scaling curves. **Their setup — NOT directly
-comparable to our QMC-SR runs**: dataset **C4** with the **Llama-2 32k tokenizer**
-(different vocab ⇒ loss values live on a different scale than our gpt2/50304 runs),
-optimizer **AdamW**, ~100 tokens/param budgets (5B @50M, 10B @100M vs our 1.07B),
-their C4 validation split. Use as anchors for their method family, not as rows in our tables.
+Original IST-DASLab runs behind the paper's scaling curves.
+
+**CORRECTION-OF-CORRECTION (2026-08-06): their C4 losses are on the LLAMA-2 token
+scale, NOT gpt2.** The `tokenizer: "gpt2"` / `vocab_size: 50304` in every run's
+`args` is a dead config field — `args.tokenizer` is consumed nowhere in `src/`;
+`dataset: "c4"` dispatches to `get_c4_data` (`src/data/c4.py`), which has hardcoded
+`AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")` (vocab 32000) since the
+original upstream commit (e02f63a). The 2026-08-04 note above-said "same scale" was
+wrong. Llama-2 packs fewer chars/token than gpt2, so its per-token CE is
+systematically LOWER; their absolute losses are NOT comparable to any of our
+gpt2-tokenized runs without a bits-per-byte conversion.
+
+**Also corrected: their effective batch is 512, not 128.** The 1.25B anchor ran
+`world_size: 4` × batch 64 × acc 2 = eff-batch 512, `iterations: 4768` — i.e. their
+protocol nearly matches our original b512 tier setup (we take 4096 steps @1.07B).
+
+At 50M the architecture and schedule match ours exactly (llama 7L/768d/6H, seq 512,
+lr 1.2e-3, wd 0.1, cosine, warmup 10%, grad_clip 1, eval_batches 32). They run
+`--compile`, we don't. Quantizer default `bits=4` matches their explicit kwargs.
 
 ## Headline table — final C4 val loss (full token budget)
 
@@ -36,11 +50,35 @@ their C4 validation split. Use as anchors for their method family, not as rows i
 ## Provenance / comparability checklist vs our QMC-SR experiments
 | Axis | Paper | Ours |
 |---|---|---|
-| dataset / val | C4 (Llama-2 tok, 32k vocab) | SlimPajama/MiniPile/RPJ/C4-slice (gpt2, 50304) |
+| dataset / val | C4 (Llama-2 tok, 32k vocab — see correction above) | SlimPajama/MiniPile/RPJ/C4-slice (gpt2, 50304); c4llama (Llama-2, 32k) |
 | optimizer | AdamW (lr 1.2e-3 @50M, 6e-4 @100M) | Muon |
 | tokens | 100/param (5B @50M, 10B @100M) | 1.07B (tier) |
 | forward quantizer | Hadamard + trust STE | plain STE grid ± (QMC-)SR |
 
-The only apples-to-apples statement available without reruns: **relative** gaps within
-each family. A direct comparison would require running their quantizers under our
-protocol (arms already exist in `QUANTIZER_CLASSES`) or ours under theirs.
+Their token-matched anchor (Llama-2 token scale): 50M W4A4 HalfHadamardTrust @1.25B
+tokens = **3.292** (C4, AdamW, effective batch 512, 4768 opt steps).
+
+**Apples-to-apples bridge (2026-08-05, jobs 731916/17, c4slice @1.07B, Muon,
+effective batch 512, 4096 opt steps): `questbase` 3.629, `queststyle` 3.645.**
+queststyle−questbase = +0.016 on C4 (+0.015 on slimpajama): SR weights inside
+their pipeline are a wash, replicated across datasets.
+
+**EXACT REPLICATION (2026-08-08, job 854842): `c4llama` dataset (same 8 C4 shards,
+Llama-2 tokenizer via the ungated hf-internal-testing mirror, their tokenization
+semantics) + their protocol (AdamW, eff-batch 512, 4768 steps, 1.25B tokens) →
+final val loss 3.294 vs their anchor 3.292.** The entire apparent gap was the
+tokenizer scale; harness, data slice, and quantizer pipeline reproduce the paper
+essentially exactly. Bonus (854843): questbase + Muon @1.07B on c4llama = 3.289 —
+Muon marginally beats their AdamW anchor with 15% fewer tokens.
+
+**Protocol-gap decomposition (2026-08-06, jobs 806891-93, questbase/c4slice/50M):
+b128-muon 3.622 (16384 steps @1.07B) | b128-adamw "paper replica" 3.626 (19073
+steps @1.25B) | b512-adamw 3.660 | b512-muon 3.629 (ref).** All four within 0.04:
+batch size, optimizer, step count, and +17% tokens each explain ~nothing. The
+resolution of the apparent 0.33 gap to their 3.292 anchor is the TOKENIZER-scale
+correction above — their per-token losses (Llama-2 tokens) are systematically lower
+than gpt2-token losses on the same text; a bits-per-byte conversion is required
+before comparing. (Ironically their true protocol — eff-batch 512, ~4.8k steps —
+was nearly identical to our tier setup all along.) The earlier slimpajama
+questbase 3.309 ≈ 3.292 "match" remains coincidence: different dataset AND
+different token scale.
