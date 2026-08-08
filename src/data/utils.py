@@ -12,6 +12,7 @@ from .redpajama import get_redpajama_data, get_redpajamav2_data
 from .slimpajama import get_slimpajama_data
 from .minipile import get_minipile_data
 from .c4_slice import get_c4_slice_data
+from .c4_llama import get_c4_llama_data
 from .c4 import get_c4_data
 
 
@@ -46,6 +47,8 @@ def get_dataset(args) -> Dict[str, np.ndarray]:
         return get_minipile_data(args.datasets_dir)
     if args.dataset == "c4slice":
         return get_c4_slice_data(args.datasets_dir)
+    if args.dataset == "c4llama":
+        return get_c4_llama_data(args.datasets_dir)
     if args.dataset == "c4":
         return get_c4_data(args.datasets_dir, 128)
     else:

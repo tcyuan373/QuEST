@@ -157,6 +157,7 @@ def parse_args(base_parser, args, namespace):
             "slimpajama_chunk1",
             "minipile",
             "c4slice",
+            "c4llama",
             "redpajamav2",
             "c4",
         ],
