@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import random
 import numpy as np
 import torch
@@ -253,7 +254,11 @@ def save_checkpoint(model, opt, scheduler, itr, ckpt_dir: Path):
         "itr": itr,
     }
     ckpt_dir.mkdir(exist_ok=True, parents=True)
-    torch.save(checkpoint, ckpt_dir / "main.pt")
+    # atomic write: preemption mid-save must never leave a truncated main.pt
+    # that a requeue then fails to load
+    tmp = ckpt_dir / "main.pt.tmp"
+    torch.save(checkpoint, tmp)
+    os.replace(tmp, ckpt_dir / "main.pt")
 
 
 def load_checkpoint(model, opt, scheduler, ckpt_path, device):
@@ -278,7 +283,9 @@ def save_worker_state(ckpt_dir: Path):
     }
     rank = 0 if not dist.is_initialized() else dist.get_rank()
     ckpt_dir.mkdir(exist_ok=True, parents=True)
-    torch.save(worker_state, ckpt_dir / f"worker_{rank}.pt")
+    tmp = ckpt_dir / f"worker_{rank}.pt.tmp"
+    torch.save(worker_state, tmp)
+    os.replace(tmp, ckpt_dir / f"worker_{rank}.pt")
 
 
 def load_worker_state(ckpt_dir: Path):
