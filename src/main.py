@@ -28,6 +28,11 @@ def main(args):
     args = distributed_backend.get_adjusted_args_for_process(args)
     args.world_size = distributed_backend.get_world_size()
 
+    if args.gquant_mode != "none":
+        # gquant consumes .grad every micro-step and keeps per-rank accumulators,
+        # which bypasses DDP gradient reduction
+        assert args.world_size == 1, "--gquant-mode requires world_size 1"
+
     if args.full_eval_at is None:
         args.full_eval_at = []
 

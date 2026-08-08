@@ -15,6 +15,7 @@ from optim.weight_averaging import (
     eval_wa,
     ExponentialWeightAverager,
 )
+from .gquant import GradAccumQuantizer
 from .utils import (
     eval,
     get_batch,
@@ -48,6 +49,20 @@ def train(
     if cfg.compile:
         print(f"Compiling model ...")
         model = torch.compile(model)
+
+    gq = None
+    if getattr(cfg, "gquant_mode", "none") != "none":
+        gq = GradAccumQuantizer(
+            not_compiled_model,
+            mode=cfg.gquant_mode,
+            bits=cfg.gquant_bits,
+            headroom=cfg.gquant_headroom,
+            acc_steps=cfg.acc_steps,
+        )
+        print(
+            f"G-quant accumulation: mode={cfg.gquant_mode} bits={cfg.gquant_bits} "
+            f"headroom={cfg.gquant_headroom} over {len(gq.params)} matrices"
+        )
 
     if "cuda" in cfg.device:
         type_ctx = torch.amp.autocast(
@@ -208,8 +223,12 @@ def train(
 
             loss = outputs["loss"] / cfg.acc_steps
             loss.backward()
+            if gq is not None:
+                gq.accumulate(curr_iter, microstep_idx)
             substep += 1
 
+        if gq is not None:
+            gq.write_back()
         if cfg.grad_clip != 0.0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         if cfg.opt == "SFAdamW":

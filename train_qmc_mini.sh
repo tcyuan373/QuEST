@@ -102,6 +102,11 @@ WARMUP_PCT=${WARMUP_PCT:-10}                 # warmup as %% of iterations
 export MUON_MOMENTUM=${MUON_MOMENTUM:-0.95}
 export WD=${WD:-0.1}
 export SR_BITS=${SR_BITS:-4}
+# G-quantization of the grad-accumulation buffer (src/optim/gquant.py);
+# none = fp32 accumulation, reproducing all prior runs. Requires ws=1.
+export GQUANT_MODE=${GQUANT_MODE:-none}
+export GQUANT_BITS=${GQUANT_BITS:-8}
+export GQUANT_HEADROOM=${GQUANT_HEADROOM:-1.0}
 export WARMUP_STEPS=$((ITERATIONS * WARMUP_PCT / 100))
 
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
@@ -137,6 +142,9 @@ torchrun --master_port=${MASTER_PORT} --nproc_per_node=${NUM_GPUS} ./src/main.py
     --muon-sr-mode ${MUON_SR_MODE} \
     --muon-sr-bits ${SR_BITS} \
     --muon-momentum ${MUON_MOMENTUM} \
+    --gquant-mode ${GQUANT_MODE} \
+    --gquant-bits ${GQUANT_BITS} \
+    --gquant-headroom ${GQUANT_HEADROOM} \
     --weight-decay ${WD} \
     --experiment-name "qmc_${NAME_TAG}_${ARM}_${MODEL_SIZE}_${RUN_SUFFIX}" \
     --auto-resume ${AUTO_RESUME}

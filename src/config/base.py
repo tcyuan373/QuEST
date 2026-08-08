@@ -85,6 +85,13 @@ def parse_args(base_parser, args, namespace):
         default=True,
         type=lambda x: str(x).lower() in ("true", "1", "yes"),
     )  # antithetic pairing across consecutive optimizer steps
+    # G-quantization: simulate low-precision gradient ACCUMULATION,
+    # G <- Q(G + g_micro) each micro-step (src/optim/gquant.py). Requires ws=1.
+    parser.add_argument(
+        "--gquant-mode", default="none", choices=["none", "det", "iid", "qmc"]
+    )
+    parser.add_argument("--gquant-bits", default=8, type=int)
+    parser.add_argument("--gquant-headroom", default=1.0, type=float)
     parser.add_argument("--batch-size", default=50, type=int)
     parser.add_argument("--acc-steps", default=4, type=int)
     parser.add_argument("--weight-decay", default=1e-1, type=float)
