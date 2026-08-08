@@ -1,0 +1,22 @@
+{
+ "fp16": 3.5035717487335205,
+ "config": {
+  "exp_dir": "exps/qmc_c4_fp16_50M_job827911",
+  "dataset_dir": "datasets_full/c4slice",
+  "methods": [
+   "ldlq_qmc"
+  ],
+  "bits": [
+   4
+  ],
+  "calib_batches": 2,
+  "eval_batches": 4,
+  "batch_size": 64,
+  "seq": 512,
+  "sr_seeds": 1,
+  "out": "ptq/ptq_smoke.json"
+ },
+ "b4_ldlq_qmc": [
+  3.5494393706321716
+ ]
+}
