@@ -85,6 +85,13 @@ def parse_args(base_parser, args, namespace):
         default=True,
         type=lambda x: str(x).lower() in ("true", "1", "yes"),
     )  # antithetic pairing across consecutive optimizer steps
+    # Momentum-buffer quantization: the persistent Muon momentum state is
+    # re-quantized every step, buf <- Q(momentum*buf + G) (src/muon.py).
+    parser.add_argument(
+        "--muon-mq-mode", default="none", choices=["none", "det", "iid", "qmc"]
+    )
+    parser.add_argument("--muon-mq-bits", default=8, type=int)
+    parser.add_argument("--muon-mq-headroom", default=1.0, type=float)
     # G-quantization: simulate low-precision gradient ACCUMULATION,
     # G <- Q(G + g_micro) each micro-step (src/optim/gquant.py). Requires ws=1.
     parser.add_argument(

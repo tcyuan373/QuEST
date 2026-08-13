@@ -95,6 +95,9 @@ class Muon(torch.optim.Optimizer):
         sr_mode="none",  # "none" | "update" | "weight" -- NS-then-round scheme
         sr_bits=4,
         sr_qmc=True,  # antithetic pairing across consecutive optimizer steps
+        mq_mode="none",  # "none" | "det" | "iid" | "qmc" -- momentum-buffer quant
+        mq_bits=8,
+        mq_headroom=1.0,
     ):
 
         defaults = dict(
@@ -118,6 +121,12 @@ class Muon(torch.optim.Optimizer):
         self.sr_bits = sr_bits
         self.sr_qmc = sr_qmc
         self._sr_step_cnt = 0  # optimizer-step counter driving the QMC sequence
+
+        assert mq_mode in ("none", "det", "iid", "qmc"), mq_mode
+        self.mq_mode = mq_mode
+        self.mq_bits = int(mq_bits)
+        self.mq_headroom = float(mq_headroom)
+        self.mq_saturated = 0  # coords clamped in the current optimizer step
 
         for idx, p in enumerate(muon_params):
             # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
@@ -166,6 +175,51 @@ class Muon(torch.optim.Optimizer):
         xq = q * step_sz - step_sz / 2
         return xq.to(x.dtype)
 
+    def _mq_quantize(self, buf, state):
+        """Momentum-buffer quantization: the persistent buffer is re-quantized
+        after every momentum update, buf <- Q(momentum*buf + G) -- accumulation
+        with NO error feedback, the same structure as gquant (src/optim/gquant.py)
+        where antithetic SR separates from iid.
+
+        Grid: zero-inclusive symmetric INT grid (buf must represent exact zero),
+        per-row absmax scale recomputed EVERY step from the pre-round buffer
+        (same per-step-scale design as NS-then-round's rms grid; a pair-frozen
+        scale clamps whenever the buffer grows across the odd step). buf evolves
+        by factor ~momentum per step, so consecutive grids nearly coincide and
+        antithetic pairs still see near-identical pre-round values. At
+        headroom >= 1 the scale covers the buffer and the clamp never binds
+        (.mq_saturated counts the exceptions).
+
+        Modes: det = round-to-nearest (swamping candidate: small G rounded away),
+        iid = fresh u per step, qmc = consecutive optimizer steps share u vs 1-u.
+        Seeding is stateless from (pair, param) -- stream disjoint from the
+        NS-then-round stream by construction.
+        """
+        qmax = 2 ** (self.mq_bits - 1) - 1
+        pair_id, parity = self._sr_step_cnt // 2, self._sr_step_cnt % 2
+        absmax = buf.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+        s = state["mq_step_size"] = self.mq_headroom * absmax.float() / qmax
+        t = buf.float() / s
+        if self.mq_mode == "det":
+            q = torch.round(t)
+        else:
+            if self.mq_mode == "qmc":
+                g = torch.Generator(device=buf.device)
+                g.manual_seed(
+                    ((pair_id * _SEED_MIX) ^ (state["sr_param_seed"] * 2 + 1))
+                    & 0x7FFFFFFF
+                )
+                u = torch.rand(
+                    t.shape, generator=g, device=buf.device, dtype=torch.float32
+                )
+                if parity == 1:
+                    u = 1.0 - u
+            else:
+                u = torch.rand_like(t)
+            q = torch.floor(t + u)
+        self.mq_saturated += int((q.abs() > qmax).sum())
+        return (q.clamp_(-qmax, qmax) * s).to(buf.dtype)
+
     def adjust_lr_for_muon(self, lr, param_shape):
         A, B = param_shape[:2]
         # We adjust the learning rate and weight decay based on the size of the parameter matrix
@@ -185,6 +239,7 @@ class Muon(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        self.mq_saturated = 0
 
         for group in self.param_groups:
 
@@ -214,6 +269,8 @@ class Muon(torch.optim.Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(g)
                 buf = state["momentum_buffer"]
                 buf.mul_(momentum).add_(g)
+                if self.mq_mode != "none":
+                    buf.copy_(self._mq_quantize(buf, state))
                 if group["nesterov"]:
                     g = g.add(buf, alpha=momentum)
                 else:

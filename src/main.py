@@ -163,6 +163,9 @@ def main(args):
             sr_mode=args.muon_sr_mode,
             sr_bits=args.muon_sr_bits,
             sr_qmc=args.muon_sr_qmc,
+            mq_mode=args.muon_mq_mode,
+            mq_bits=args.muon_mq_bits,
+            mq_headroom=args.muon_mq_headroom,
         )
         
     else:

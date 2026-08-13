@@ -107,6 +107,11 @@ export SR_BITS=${SR_BITS:-4}
 export GQUANT_MODE=${GQUANT_MODE:-none}
 export GQUANT_BITS=${GQUANT_BITS:-8}
 export GQUANT_HEADROOM=${GQUANT_HEADROOM:-1.0}
+# Momentum-buffer quantization inside Muon (src/muon.py, buf <- Q(m*buf + G));
+# none = fp32 buffer, reproducing all prior runs.
+export MQUANT_MODE=${MQUANT_MODE:-none}
+export MQUANT_BITS=${MQUANT_BITS:-8}
+export MQUANT_HEADROOM=${MQUANT_HEADROOM:-1.0}
 export WARMUP_STEPS=$((ITERATIONS * WARMUP_PCT / 100))
 
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
@@ -145,6 +150,9 @@ torchrun --master_port=${MASTER_PORT} --nproc_per_node=${NUM_GPUS} ./src/main.py
     --gquant-mode ${GQUANT_MODE} \
     --gquant-bits ${GQUANT_BITS} \
     --gquant-headroom ${GQUANT_HEADROOM} \
+    --muon-mq-mode ${MQUANT_MODE} \
+    --muon-mq-bits ${MQUANT_BITS} \
+    --muon-mq-headroom ${MQUANT_HEADROOM} \
     --weight-decay ${WD} \
     --experiment-name "qmc_${NAME_TAG}_${ARM}_${MODEL_SIZE}_${RUN_SUFFIX}" \
     --auto-resume ${AUTO_RESUME}
