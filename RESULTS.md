@@ -43,15 +43,41 @@ fp16 forward arm, vs fp32-accum ref 3.574. Jobs 862496-99, 870039-44.
 - Accumulation cost (qmc arm): 8b ~free (+0.01), 6b +0.05, 4b +0.22.
 - Single seed per cell.
 
-## Momentum-buffer quantization (launched 2026-08-13, pending)
+## Momentum-buffer quantization (2026-08-13)
 
 `buf <- Q(0.95*buf + G)` every step inside Muon (src/muon.py, `mq_*` knobs) —
 the same accumulate-without-error-feedback structure, applied to the largest
-persistent optimizer state. Ladder {det,iid,qmc} x {8,6,4} bits, fp16 arm,
-jobs 928750-58 (gated on smoke 928749). Mechanism note: consecutive pre-round
-values differ by momentum-scaling of the grid indices, which scrambles
-fractional parts at high bits — antithetic leverage is expected mainly at low
-bits, so `antithetic ≈ iid at 8b, separation at 4b` would be coherent.
+persistent optimizer state. Fp16 arm vs ref 3.574, jobs 928750-58:
+
+| buffer bits | det | iid SR | antithetic SR |
+|---|---|---|---|
+| 8 | 3.575 | 3.573 | 3.575 |
+| 6 | 3.580 | 3.586 | 3.582 |
+| 4 | 3.667 | 3.700 | **3.653** |
+
+- **Antithetic-vs-iid gap replicates the G-quant pattern and is monotone in
+  bits**: ~0 @8b, −0.004 @6b, **−0.047 @4b** — the predicted low-bit-leverage
+  mechanism (fractional-part correlation survives only when grid indices are
+  small) held exactly: antithetic ≈ iid at 8b, separation at 4b.
+- **Antithetic beats det at 4 bits too** (3.653 vs 3.667) — best mode overall.
+- **Det does NOT collapse** here (3.667 vs G-quant's 4.053 @4b): the fresh
+  gradient enters at full precision before each single rounding, so swamping
+  is far milder than in the micro-step accumulator.
+- **4-bit momentum state is cheap**: +0.079 (qmc) over fp32 — cheaper than
+  4-bit G-accumulation (+0.22). 8b/6b are free-to-negligible. Single seed.
+
+### Cross-pipeline transfer (4-bit mq under other forward pipelines)
+
+| forward arm | no mq (seed refs) | + mq4 det | + mq4 qmc |
+|---|---|---|---|
+| fp16 | 3.574 | 3.667 | 3.653 |
+| questbase (QuEST W4A4) | 3.625 ± 0.003 | 3.704 | 3.692 |
+| detbase (FP4 det) | 4.211 ± 0.055 (3 seeds) | 4.124 | 4.103 |
+
+Antithetic > det in every pipeline (−0.014 / −0.012 / −0.021); the ~+0.07
+4-bit cost transfers to questbase. Under detbase the mq runs land BELOW the
+no-mq seed mean (~1.7-2σ) — momentum SR appears to act as a stabilizing
+dither on the fragile det-weights arm rather than a cost (single seed each).
 
 ## Forward-pipeline three-way: us vs deterministic baselines vs QuEST (c4slice)
 
@@ -65,15 +91,20 @@ Identical tier protocol, W4A4, finals @4096:
 | qmcfwd (QMC-SR weights only) | 4.122 |
 | rtn (deterministic, same uniform grid as ours) | 4.142 |
 | iidfwd (iid-SR weights) | 4.180 |
-| detbase (FP4 deterministic) | 4.274 (1 seed; seed pair pending, jobs 928774/75) |
+| detbase (FP4 deterministic) | 4.274; seeds {4.274, 4.184, 4.175} mean 4.211 ± 0.055 |
 
 Our plain-grid stack beats both deterministic baselines; QuEST's activation
 pipeline dominates all uniform-grid-activation arms by ~0.45 — activation-side
 design is their edge, which is why the program pivoted to optimizer-state
-quantization. Same ordering held on slimpajama. Pending additions (2026-08-13):
-qmcfull + 6-bit NS-round on c4 (job 928773, best-stack row); momentum-quant
-4-bit det/qmc composed under detbase and questbase pipelines (jobs 928769-72,
-does the mq verdict transfer beyond the fp16 arm?).
+quantization. Same ordering held on slimpajama. detbase seed verdict
+(2026-08-13, jobs 928774/75): moderately noisy (σ 0.055) but NOT
+rtn-catastrophic (rtn seeds spanned 3.81-4.93) — the seed-fragility claim
+stays specific to the uniform-grid RTN arm. Best-stack attempt (job 928773):
+qmcfull + 6-bit NS-round on c4 = **4.335**, WORSE than 4-bit qmcfull (4.080)
+and than no NS-round (qmcfwd 4.122) — opposite sign to the 100M slimpajama
+result where 6-bit was the fix (3.708); NS-round bit-width sensitivity is
+strongly scale/dataset-dependent and plain-grid arm σ~0.1 blurs single-seed
+reads. The NS-round lever does not transfer as "6 bits always".
 
 ## SR-weights penalty inside the QuEST pipeline (W-bit ladder)
 
