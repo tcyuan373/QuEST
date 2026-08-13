@@ -38,7 +38,10 @@ import torch
 
 class GradAccumQuantizer:
     def __init__(self, model, mode, bits=8, headroom=1.0, acc_steps=8):
-        assert mode in ("det", "iid", "qmc")
+        assert mode in ("det", "iid", "qmc", "lattice", "vdc")
+        if mode == "vdc":
+            # bit-reversal ordering needs a power-of-two window
+            assert acc_steps & (acc_steps - 1) == 0, acc_steps
         self.mode = mode
         self.bits = int(bits)
         self.qmax = 2 ** (self.bits - 1) - 1
@@ -61,6 +64,23 @@ class GradAccumQuantizer:
         return (span / self.qmax).view(-1, *([1] * (g.ndim - 1)))
 
     def _u(self, step, micro, idx, shape, device):
+        if self.mode in ("lattice", "vdc"):
+            # "Loyal" randomized-QMC: ONE base draw per (step, param) window,
+            # then a length-m low-discrepancy set across the m micro-steps
+            # (Cranley-Patterson random shift keeps every draw uniform):
+            #   lattice: u_i = frac(u + i/m)   -- natural order
+            #   vdc:     u_i = frac(u + phi2(i)) -- same point set for m=2^k,
+            #            bit-reversed (van der Corput) order; 1-D Sobol and
+            #            Halton reduce to this, so those names are subsumed.
+            # Fresh seed scheme (does not collide with the iid/qmc streams).
+            gen = torch.Generator(device=device)
+            gen.manual_seed(((int(step) * 100003 + idx) * 8 + 5) & 0x7FFFFFFFFFFF)
+            u = torch.rand(shape, generator=gen, device=device, dtype=torch.float32)
+            i = micro
+            if self.mode == "vdc":
+                nbits = self.acc_steps.bit_length() - 1
+                i = int(format(i, f"0{nbits}b")[::-1], 2) if nbits else 0
+            return torch.frac(u + i / self.acc_steps)
         if self.mode == "qmc":
             pair, flip = micro // 2, micro % 2 == 1
         else:
