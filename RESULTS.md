@@ -53,6 +53,28 @@ values differ by momentum-scaling of the grid indices, which scrambles
 fractional parts at high bits — antithetic leverage is expected mainly at low
 bits, so `antithetic ≈ iid at 8b, separation at 4b` would be coherent.
 
+## Forward-pipeline three-way: us vs deterministic baselines vs QuEST (c4slice)
+
+Identical tier protocol, W4A4, finals @4096:
+
+| arm | val_loss |
+|---|---|
+| fp16 reference | 3.574 |
+| questbase (QuEST Hadamard+trust) | 3.629 (3-seed mean 3.625 ± 0.003) |
+| qmcfull (us: QMC-SR weights + NS-then-round) | 4.080 |
+| qmcfwd (QMC-SR weights only) | 4.122 |
+| rtn (deterministic, same uniform grid as ours) | 4.142 |
+| iidfwd (iid-SR weights) | 4.180 |
+| detbase (FP4 deterministic) | 4.274 (1 seed; seed pair pending, jobs 928774/75) |
+
+Our plain-grid stack beats both deterministic baselines; QuEST's activation
+pipeline dominates all uniform-grid-activation arms by ~0.45 — activation-side
+design is their edge, which is why the program pivoted to optimizer-state
+quantization. Same ordering held on slimpajama. Pending additions (2026-08-13):
+qmcfull + 6-bit NS-round on c4 (job 928773, best-stack row); momentum-quant
+4-bit det/qmc composed under detbase and questbase pipelines (jobs 928769-72,
+does the mq verdict transfer beyond the fp16 arm?).
+
 ## SR-weights penalty inside the QuEST pipeline (W-bit ladder)
 
 queststyle (= questbase + SR weights) minus questbase, c4slice protocol:
