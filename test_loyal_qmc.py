@@ -138,6 +138,47 @@ check(
     "strat draws differ across optimizer steps",
     not torch.allclose(ust[0], ust2, atol=1e-6),
 )
+# jitter fresh WITHIN the window: a frozen-jitter mutant (one xi per window =
+# shifted permuted lattice, not LHS) passes every other check in this file --
+# the within-window fractional parts must vary across micro-steps
+xi_hat = ust * M - torch.floor(ust * M)
+check(
+    "strat within-window jitter varies across micro-steps",
+    bool((xi_hat.reshape(M, -1).std(0) > 1e-3).all()),
+    f"min per-coord std {xi_hat.reshape(M, -1).std(0).min():.3f}",
+)
+# seed-expression-free shared-pi cross-check: the base shift cancels in
+# pairwise latperm differences, so frac(up_i - up_j)*M must equal the strat
+# stratum difference mod M -- verified purely from implementation draws
+# (catches a seed typo replicated into the reconstruction checks above)
+strata_s = torch.floor(ust * M)
+pd_ok = True
+for i in range(M):
+    for j in range(M):
+        if i == j:
+            continue
+        lhs = torch.round(torch.frac(up[i] - up[j] + 1.0) * M) % M
+        pd_ok = pd_ok and bool(torch.equal(lhs, (strata_s[i] - strata_s[j]) % M))
+check("latperm/strat shared pi verified from draws alone (pairwise diffs)", pd_ok)
+
+# non-power-of-two windows: latperm/strat are valid at any m (only vdc is not)
+M6 = 6
+u6s = torch.stack(
+    [GradAccumQuantizer(Toy(), "strat", bits=4, acc_steps=M6)._u(2, i, 0, p0.shape, p0.device) for i in range(M6)]
+)
+s6, _ = u6s.reshape(M6, -1).sort(dim=0)
+check(
+    "strat stratified at non-power-of-two m=6",
+    bool((torch.floor(s6 * M6) == torch.arange(M6).unsqueeze(1)).all()),
+)
+u6p = torch.stack(
+    [GradAccumQuantizer(Toy(), "latperm", bits=4, acc_steps=M6)._u(2, i, 0, p0.shape, p0.device) for i in range(M6)]
+)
+s6p, _ = u6p.reshape(M6, -1).sort(dim=0)
+check(
+    "latperm hits every stratum once at m=6",
+    bool((torch.floor(s6p * M6) == torch.arange(M6).unsqueeze(1)).all()),
+)
 
 # --- unbiasedness (each draw is marginally uniform via the random shift) ----
 TRIALS = 1200
@@ -209,6 +250,35 @@ for mode in ("lattice", "vdc", "latperm", "strat"):
         torch.equal(one_window(mode), one_window(mode)),
     )
 
+# windowed MC unbiasedness: the acc_steps=1 test above degenerates to a plain
+# uniform draw, so window-construction bias (e.g. ranks in {1..m}, missing
+# frac wrap) is invisible to it -- run full 8-micro windows
+def window_bias(mode, trials=600):
+    m_ = Toy()
+    gref = GradAccumQuantizer(m_, mode, bits=4, acc_steps=M)
+    g_ = {p: torch.randn_like(p) * 0.1 for _, p in gref.params}
+    acc_ = None
+    for t in range(trials):
+        gq_t = GradAccumQuantizer(m_, mode, bits=4, acc_steps=M)
+        run_window(gq_t, [g_] * M, step=t)
+        got = torch.cat([p.grad.float().flatten() for _, p in gq_t.params])
+        acc_ = got if acc_ is None else acc_ + got
+    mean_ = acc_ / trials
+    tgt_ = torch.cat([M * g_[p].flatten() for _, p in gq_t.params])
+    st_ = torch.cat(
+        [gq_t.step_size[i].expand_as(p).flatten() for i, (_, p) in enumerate(gq_t.params)]
+    )
+    return ((mean_ - tgt_) / st_).abs().max()
+
+se_w = 0.5 * M**0.5 / 600**0.5  # conservative per-window error-std bound
+for mode in ("latperm", "strat"):
+    b = window_bias(mode)
+    check(
+        f"{mode} full-window SR is unbiased (max coord)",
+        b < 4.5 * se_w,
+        f"max |bias|/step = {b:.4f} (thr {4.5 * se_w:.3f})",
+    )
+
 # strat's guaranteed property: window MSE <= iid on the correlated window
 e_strat, e_latperm = window_err("strat"), window_err("latperm")
 check(
@@ -234,7 +304,6 @@ opt, params = make_opt("lattice")
 p = params[0]
 state = opt.state[p]
 x = torch.randn_like(p) * 0.05
-us = []
 for cnt in range(8):
     opt._sr_step_cnt = cnt
     opt._mq_quantize(x, state)  # sets scale; draw happens inside
@@ -302,6 +371,50 @@ for mode in ("latperm", "strat"):
             [opt.state[p]["momentum_buffer"].flatten() for p in params]
         )
     check(f"mq {mode} sequence reproducible", torch.equal(run_seq_m(), run_seq_m()))
+
+
+# --- mq real-draw contract checks -------------------------------------------
+# The structural checks above reconstruct point sets test-side; these observe
+# the REAL _mq_quantize output and pin it to the documented seed contract
+# (kills wrong-seed / wrong-offset-law / frozen-jitter mutants at the mq site).
+def mq_contract_u(mode, cnt, ps, shape):
+    block, phase = cnt // 8, cnt % 8
+    if mode in ("lattice", "latperm"):
+        g = torch.Generator()
+        g.manual_seed(((block * _SEED_MIX) ^ (ps * 4 + 3)) & 0x7FFFFFFF)
+        base = torch.rand(shape, generator=g, dtype=torch.float32)
+    if mode in ("latperm", "strat"):
+        gp = torch.Generator()
+        gp.manual_seed(((block * _SEED_MIX) ^ (ps * 8 + 5)) & 0x7FFFFFFF)
+        R = torch.rand((8, *shape), generator=gp, dtype=torch.float32)
+        pi = (R < R[phase]).sum(0).float()
+    if mode == "lattice":
+        return torch.frac(base + phase / 8)
+    if mode == "latperm":
+        return torch.frac(base + pi / 8)
+    gj = torch.Generator()
+    gj.manual_seed(((cnt * _SEED_MIX) ^ (ps * 8 + 7)) & 0x7FFFFFFF)
+    xi = torch.rand(shape, generator=gj, dtype=torch.float32)
+    return (pi + xi) / 8
+
+
+for mode in ("lattice", "latperm", "strat"):
+    opt_m, params_m = make_opt(mode)
+    pm = params_m[0]
+    st = opt_m.state[pm]
+    xm = torch.randn_like(pm) * 0.05
+    qmax = 2 ** (4 - 1) - 1
+    ok = True
+    for cnt in range(16):  # two blocks incl. the block-boundary rollover
+        opt_m._sr_step_cnt = cnt
+        out = opt_m._mq_quantize(xm, st)
+        s = st["mq_step_size"]
+        u = mq_contract_u(mode, cnt, st["sr_param_seed"], xm.shape)
+        want = (
+            torch.floor(xm.float() / s + u).clamp(-qmax, qmax) * s
+        ).to(xm.dtype)
+        ok = ok and torch.equal(out, want)
+    check(f"mq {mode} realized draws match seed contract (2 blocks)", ok)
 
 print()
 if FAILS:

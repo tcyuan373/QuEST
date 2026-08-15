@@ -82,10 +82,14 @@ Antithetic > det in every pipeline (−0.014 / −0.012 / −0.021); the ~+0.07
 4-bit cost transfers to questbase. Under detbase the mq runs land BELOW the
 no-mq seed mean (~1.7-2σ) — momentum SR appears to act as a stabilizing
 dither on the fragile det-weights arm rather than a cost (single seed each).
-iid/lattice columns added 2026-08-14 (jobs 982081/82, 982091/92): the mode
-ordering **qmc < lattice < det < iid is identical in all three pipelines** —
-the strongest structural result of the momentum-quant study, since the three
-forward arms span a 0.6-loss range.
+iid/lattice columns added 2026-08-14 (jobs 982081/82, 982091/92):
+**qmc is strictly best and iid strictly worst in all three pipelines** —
+a real structural result, since the three forward arms span a 0.6-loss
+range. (CORRECTED 2026-08-15: an earlier revision claimed the full chain
+qmc<lattice<det<iid was identical in all three pipelines; the table above
+contradicts that — det beats lattice on questbase and detbase. The
+lattice/det middle pair flips with pipeline and sits inside the
+~0.008-0.02 single-seed/assignment-noise band.)
 
 ### Scale transfer to 100M (slimpajama, jobs 298-302)
 
@@ -93,9 +97,10 @@ forward arms span a 0.6-loss range.
 |---|---|---|---|---|---|
 | val_loss | 3.196 | 3.303 | 3.321 | **3.275** | 3.292 |
 
-Same ordering at 2x model scale and on a different dataset, with the same
-spread (qmc−iid −0.046 @100M vs −0.047 @50M) — the antithetic momentum gain
-is scale- and data-stable, unlike the NS-round lever.
+The fp16-arm ordering (qmc < lattice < det < iid) reproduces exactly at 2x
+model scale on a different dataset, with the same spread (qmc−iid −0.046
+@100M vs −0.047 @50M) — the antithetic momentum gain is scale- and
+data-stable, unlike the NS-round lever.
 
 ## Loyal randomized-QMC: does higher-order beat the 2-point pair? (2026-08-14)
 
@@ -123,10 +128,12 @@ Head-to-head vs antithetic (positive = lattice/vdc is WORSE):
 van der Corput (gquant 4b only): **3.802** — worse than lattice (3.794) and
 antithetic (3.790), better than iid (3.831).
 
-- **Higher-order QMC does not beat the 2-point pair** — antithetic ties or
-  wins in all 9 cells, sign-consistent, and the 4-bit deficit grows with
-  pipeline fragility (+0.004 to +0.040). But see the nuisance caveat below:
-  the per-cell gaps are not individually resolved.
+- **Higher-order QMC does not beat the 2-point pair** — antithetic wins
+  every 4-bit cell (+0.004 to +0.040, growing with pipeline fragility) and
+  gq6 (+0.006); the remaining 6/8-bit cells are ties within ±0.002, two of
+  them nominally lattice-favoring (mq8 −0.001, mq6 −0.002). Nothing beats
+  antithetic anywhere, but see the nuisance caveat below: gaps under ~0.008
+  are not individually resolved.
 - **Lattice/vdc recover ~80-95% of the iid→antithetic gain** (e.g. mq4:
   iid→lattice −0.038 of the −0.047 total). Three structurally different
   randomizations all land in the same place, which is the real evidence that
@@ -139,21 +146,26 @@ antithetic (3.790), better than iid (3.831).
   fine ordering among SR variants at 4 bits is inside assignment/seed noise;
   only iid-vs-everything-else (~0.03-0.05) is resolved. Controls queued:
   `latperm` (same lattice points, random per-coordinate assignment — isolates
-  the nuisance directly) and `strat` (Latin-hypercube jitter, the only mode
-  with a per-window Var<=iid guarantee for arbitrary integrands).
+  the nuisance directly) and `strat` (Latin-hypercube jitter; Var<=iid is
+  guaranteed for the monotone rounding integrands of a fixed-grid window —
+  exact at the gquant site, where the on-grid accumulator freezes
+  frac(t_i)=frac(g_i/s); heuristic at mq, where the per-step rescale and
+  buffer feedback make the window adaptive. For arbitrary integrands the
+  only universal bound is Var <= (m/(m-1))·Var_iid, Owen's 8/7 at m=8).
 - **Mechanism claim RETRACTED (2026-08-14).** The earlier "the integrand is
   near-linear in the fractional part, so the antipodal pair is optimal" story
   is wrong: f(u) = floor(t+u) − t is a step function (V(f)=1), and
   Koksma-Hlawka with shifted-lattice star discrepancy 1/m predicts lattice
   should be at LEAST as good as the pair. The measured reversal therefore
   contradicts the natural theory instead of confirming a mechanism — one more
-  reason to treat the 0.004-0.017 antithetic edges as unresolved. (The unit
+  reason to treat the 0.004-0.040 antithetic edges as unresolved. (The unit
   test's drift-free correlated window shows lattice 4x BETTER than antithetic
   in window MSE, per theory; whatever reverses this in training is not
   explained.)
 - Cost: no measurable throughput difference (iter_dt 3.62-3.78s across all
-  modes). Single seed per cell; the 4-bit gaps (0.004-0.040) sit at or below
-  fp16-arm σ except at detbase/100M.
+  modes). Single seed per cell; the small/mid 4-bit gaps (gq4 +0.004, mq4
+  +0.009, questbase +0.013) are ~1-3σ and inside the 0.008 assignment-noise
+  band; only detbase (+0.040) and 100M (+0.017) clear it.
 
 ## Forward-pipeline three-way: us vs deterministic baselines vs QuEST (c4slice)
 
@@ -229,8 +241,8 @@ shows NO such fragility (sigma ~0.003-0.005).
 ## Grand synthesis
 
 SR's value lives in **temporal accumulation during training** — gradient
-accumulation (antithetic wins), seed stability, momentum (antithetic wins,
-ordering invariant across 3 forward pipelines and 2 model scales) — NOT in
+accumulation (antithetic wins), seed stability, momentum (antithetic best
+and iid worst across 3 forward pipelines and 2 model scales) — NOT in
 one-shot rounding (LDLQ wins), not inside strong forward pipelines (monotone
 penalty), and its forward-pass cost grows at low bits. Program ranking:
 G-quantization > master-weight/momentum storage > update compression.

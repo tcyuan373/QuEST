@@ -218,8 +218,17 @@ class Muon(torch.optim.Optimizer):
                 #            isolates the point->step assignment
                 #   strat:   (pi(phase) + jitter)/8, same pi stream, fresh
                 #            within-stratum jitter per step (Latin hypercube
-                #            along the step axis; per-window Var <= iid for
-                #            any integrand)
+                #            along the step axis; Var <= (8/7)*Var_iid worst
+                #            case for fixed integrands, <= Var_iid only in
+                #            the homogeneous limit -- HERE the per-step
+                #            rescale and buffer feedback make the window
+                #            adaptive, so strat is a strong heuristic
+                #            control, not a proven-safe one; the clean
+                #            monotonicity guarantee applies to gquant only)
+                # Seeding note: the XOR-of-linear scheme admits sparse
+                # cross-param/cross-block stream coincidences (benign dither
+                # correlation); same-param same-block collisions among base/
+                # perm/jitter are impossible (odd-constant invertibility).
                 block, phase = self._sr_step_cnt // 8, self._sr_step_cnt % 8
                 if self.mq_mode in ("latperm", "strat"):
                     genp = torch.Generator(device=buf.device)

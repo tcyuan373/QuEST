@@ -36,12 +36,22 @@ Modes:
                     between lattice and vdc.
            strat:   (pi(micro) + xi_micro)/m, same pi stream as latperm
                     but an INDEPENDENT within-stratum jitter xi per draw
-                    (Latin-hypercube along the window axis). Unlike any
-                    blind fixed point set, per-coordinate window variance
-                    is <= iid for every integrand -- the guaranteed-safe
-                    control.
+                    (Latin-hypercube along the window axis). Guarantees:
+                    for ARBITRARY fixed integrands only Var <= (m/(m-1)) *
+                    Var_iid (Owen; the 8/7 bound is attained by anti-aligned
+                    stratum profiles). Var <= Var_iid additionally holds
+                    whenever the window's integrands are monotone in u with
+                    similarly-ordered stratum profiles (Chebyshev sum
+                    inequality) -- true of every realizable window AT THIS
+                    SITE, since the on-grid accumulator fixes frac(t_i) =
+                    frac(g_i/s) and each error floor(theta+u)-theta is
+                    nondecreasing in u. So strat is the safe control here;
+                    the same claim does NOT formally extend to the adaptive
+                    mq window in muon.py.
          All four share the Cranley-Patterson property that every single
-         draw is marginally U[0,1), hence unbiased.
+         draw is marginally U[0,1), so each rounding is unbiased in
+         isolation; draws are dependent ACROSS micro-steps, so per-step
+         conditional-on-past uniformity holds only for iid.
 
 Index-clamp bounds for THIS grid (q = round-or-floor of t = x/step) are
 [-qmax, qmax]; validated against torch.round in test_gquant.py (the centered
@@ -60,6 +70,9 @@ class GradAccumQuantizer:
         if mode == "vdc":
             # bit-reversal ordering needs a power-of-two window
             assert acc_steps & (acc_steps - 1) == 0, acc_steps
+        if mode == "strat":
+            # jitter seed indexes (step*64 + micro); larger windows would alias
+            assert acc_steps <= 64, acc_steps
         self.mode = mode
         self.bits = int(bits)
         self.qmax = 2 ** (self.bits - 1) - 1
@@ -89,8 +102,12 @@ class GradAccumQuantizer:
             #   ((step*100003 + idx)*8 + 6) -- permutation keys R, shared by
             #       latperm/strat (same pi, differing only in the offset law);
             #   ((step*64 + micro)*100003 + idx)*8 + 7 -- strat jitter, fresh
-            #       per micro-step.
-            # None collide with the iid/qmc streams.
+            #       per micro-step (requires acc_steps <= 64, asserted in
+            #       __init__, else (step,micro) aliases into the next step).
+            # The three window streams are mutually disjoint (distinct mod-8
+            # residues). The iid/qmc streams use a different seed law that CAN
+            # coincide with these across runs of different modes -- irrelevant
+            # within a run, where only one family is ever drawn.
             m = self.acc_steps
             if self.mode in ("latperm", "strat"):
                 # per-coordinate uniform permutation: rank of this micro's key
@@ -104,6 +121,10 @@ class GradAccumQuantizer:
                     genj = torch.Generator(device=device)
                     genj.manual_seed((((int(step) * 64 + micro) * 100003 + idx) * 8 + 7) & 0x7FFFFFFFFFFF)
                     xi = torch.rand(shape, generator=genj, device=device, dtype=torch.float32)
+                    # fp32 edge: (m-1 + xi)/m can round to exactly 1.0 with
+                    # prob ~2^-25 per draw (floor then adds a full step);
+                    # realized bias ~1e-15 -- accepted, not clamped, to keep
+                    # streams bit-identical with the 2026-08-14 tier runs.
                     return (pi + xi) / m
                 i = pi  # latperm: lattice points, permuted assignment
             else:
