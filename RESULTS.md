@@ -128,12 +128,12 @@ Head-to-head vs antithetic (positive = lattice/vdc is WORSE):
 van der Corput (gquant 4b only): **3.802** — worse than lattice (3.794) and
 antithetic (3.790), better than iid (3.831).
 
-- **Higher-order QMC does not beat the 2-point pair** — antithetic wins
-  every 4-bit cell (+0.004 to +0.040, growing with pipeline fragility) and
-  gq6 (+0.006); the remaining 6/8-bit cells are ties within ±0.002, two of
-  them nominally lattice-favoring (mq8 −0.001, mq6 −0.002). Nothing beats
-  antithetic anywhere, but see the nuisance caveat below: gaps under ~0.008
-  are not individually resolved.
+- **No blind fixed point set beats the 2-point pair** — vs lattice/vdc,
+  antithetic wins every 4-bit cell (+0.004 to +0.040, growing with pipeline
+  fragility) and gq6 (+0.006); the remaining 6/8-bit cells are ties within
+  ±0.002, two of them nominally lattice-favoring (mq8 −0.001, mq6 −0.002).
+  But stratified jitter DOES edge it at gq4 — see the controls results
+  below — and gaps under ~0.008 are not individually resolved.
 - **Lattice/vdc recover ~80-95% of the iid→antithetic gain** (e.g. mq4:
   iid→lattice −0.038 of the −0.047 total). Three structurally different
   randomizations all land in the same place, which is the real evidence that
@@ -144,7 +144,7 @@ antithetic (3.790), better than iid (3.831).
   in which point goes to which micro-step; that pure reassignment moved gq4
   by 0.008 (3.794 vs 3.802) — 2x the antithetic-vs-lattice gap (0.004). The
   fine ordering among SR variants at 4 bits is inside assignment/seed noise;
-  only iid-vs-everything-else (~0.03-0.05) is resolved. Controls queued:
+  only iid-vs-everything-else (~0.03-0.05) is resolved. Controls:
   `latperm` (same lattice points, random per-coordinate assignment — isolates
   the nuisance directly) and `strat` (Latin-hypercube jitter; Var<=iid is
   guaranteed for the monotone rounding integrands of a fixed-grid window —
@@ -152,6 +152,34 @@ antithetic (3.790), better than iid (3.831).
   frac(t_i)=frac(g_i/s); heuristic at mq, where the per-step rescale and
   buffer feedback make the window adaptive. For arbitrary integrands the
   only universal bound is Var <= (m/(m-1))·Var_iid, Owen's 8/7 at m=8).
+
+### Ordering controls results (2026-08-15, jobs 51785-88)
+
+Fp16 arm, 4-bit, protocol identical to the mode matrices above:
+
+| site | det | iid | qmc | lattice | vdc | latperm | strat |
+|---|---|---|---|---|---|---|---|
+| gquant 4b | 4.053 | 3.831 | 3.790 | 3.794 | 3.802 | 3.793 | **3.782** |
+| mquant 4b | 3.667 | 3.700 | **3.653** | 3.662 | — | 3.659 | 3.656 |
+
+- **latperm ≈ lattice at both sites** (Δ −0.001 gq, −0.003 mq): randomizing
+  the point→step assignment does nothing systematic, so the lattice-vs-vdc
+  0.008 split was assignment NOISE, as suspected — retro-justifying the
+  ~0.008 unresolved band for all fine per-mode gaps.
+- **strat is the best gquant mode outright** (3.782, beating antithetic's
+  3.790 by 0.008) and ties antithetic at mq (3.656 vs 3.653, inside noise).
+  The one construction with a per-window variance guarantee (monotone
+  integrands + LHS at the fixed-grid site) lands at-or-near the top of both
+  tables — consistent with the guarantee being real rather than lucky.
+- Revised reading of the whole study: the active ingredient is **window-level
+  stratification of the dither**, not the specific antithetic pairing. Four
+  structurally different correlated constructions (qmc/lattice/latperm/strat)
+  cluster within ~0.012 of each other while iid sits ~0.04 higher and det
+  collapses (gquant) or trails (mq). Among the cluster, per-mode gaps are at
+  noise scale; **strat is the recommended default** (guarantee + empirically
+  best/tied), with antithetic as the cheap 2-point special case (no
+  per-window key tensor, half the RNG).
+- Single seed per cell, same caveat as the rest of the matrix.
 - **Mechanism claim RETRACTED (2026-08-14).** The earlier "the integrand is
   near-linear in the fractional part, so the antipodal pair is optimal" story
   is wrong: f(u) = floor(t+u) − t is a step function (V(f)=1), and
@@ -247,10 +275,12 @@ one-shot rounding (LDLQ wins), not inside strong forward pipelines (monotone
 penalty), and its forward-pass cost grows at low bits. Program ranking:
 G-quantization > master-weight/momentum storage > update compression.
 Within the family of **blind time-axis point sets** the construction looks
-saturated: antithetic/lattice/vdc all land within ~0.01 of each other (their
-fine ordering unresolved at single-seed, single-assignment noise) while all
-recover most of the iid gap. Pending the latperm/strat controls, remaining
-headroom is more likely in WHERE the dither acts than in fancier blind
-sequences — the coordinate axis (m ~ 1e6 vs the time axis's m = 8, and NS
-mixes within rows) and "sighted" dither (frac(t) is known before u is drawn;
-every current mode ignores it) are the unexplored axes.
+saturated: antithetic/lattice/vdc/latperm/strat all land within ~0.012 of
+each other (fine ordering unresolved at single-seed noise; strat best at
+gquant, antithetic at mq) while all recover most of the iid gap — the active
+ingredient is window-level stratification, with strat the recommended
+default (guarantee + top-or-tied) and antithetic the cheap special case.
+Remaining headroom is more likely in WHERE the dither acts than in fancier
+blind sequences — the coordinate axis (m ~ 1e6 vs the time axis's m = 8, and
+NS mixes within rows) and "sighted" dither (frac(t) is known before u is
+drawn; every current mode ignores it) are the unexplored axes.
