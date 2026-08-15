@@ -122,7 +122,9 @@ class Muon(torch.optim.Optimizer):
         self.sr_qmc = sr_qmc
         self._sr_step_cnt = 0  # optimizer-step counter driving the QMC sequence
 
-        assert mq_mode in ("none", "det", "iid", "qmc", "lattice"), mq_mode
+        assert mq_mode in (
+            "none", "det", "iid", "qmc", "lattice", "latperm", "strat"
+        ), mq_mode
         self.mq_mode = mq_mode
         self.mq_bits = int(mq_bits)
         self.mq_headroom = float(mq_headroom)
@@ -191,9 +193,10 @@ class Muon(torch.optim.Optimizer):
         (.mq_saturated counts the exceptions).
 
         Modes: det = round-to-nearest (swamping candidate: small G rounded away),
-        iid = fresh u per step, qmc = consecutive optimizer steps share u vs 1-u.
-        Seeding is stateless from (pair, param) -- stream disjoint from the
-        NS-then-round stream by construction.
+        iid = fresh u per step, qmc = consecutive optimizer steps share u vs 1-u,
+        lattice/latperm/strat = block-of-8 window constructions (see inline
+        comment). Seeding is stateless from (pair-or-block, param) -- streams
+        disjoint from the NS-then-round stream by construction.
         """
         qmax = 2 ** (self.mq_bits - 1) - 1
         pair_id, parity = self._sr_step_cnt // 2, self._sr_step_cnt % 2
@@ -203,21 +206,55 @@ class Muon(torch.optim.Optimizer):
         if self.mq_mode == "det":
             q = torch.round(t)
         else:
-            if self.mq_mode == "lattice":
-                # "Loyal" randomized-QMC: one base draw per block of 8
-                # consecutive optimizer steps, u_i = frac(u + phase/8)
-                # (Cranley-Patterson shifted rank-1 lattice; buf autocorr
-                # 0.95^7 ~ 0.70 keeps the window's values correlated).
+            if self.mq_mode in ("lattice", "latperm", "strat"):
+                # Window constructions over blocks of 8 consecutive optimizer
+                # steps (buf autocorr 0.95^7 ~ 0.70 keeps the window's values
+                # correlated). Mirrors gquant's mode family exactly:
+                #   lattice: u = frac(base + phase/8), natural order
+                #            (Cranley-Patterson shifted rank-1 lattice)
+                #   latperm: frac(base + pi(phase)/8) -- SAME base draw and
+                #            point set as lattice (identical seed), fresh
+                #            per-coordinate random permutation pi per block:
+                #            isolates the point->step assignment
+                #   strat:   (pi(phase) + jitter)/8, same pi stream, fresh
+                #            within-stratum jitter per step (Latin hypercube
+                #            along the step axis; per-window Var <= iid for
+                #            any integrand)
                 block, phase = self._sr_step_cnt // 8, self._sr_step_cnt % 8
-                g = torch.Generator(device=buf.device)
-                g.manual_seed(
-                    ((block * _SEED_MIX) ^ (state["sr_param_seed"] * 4 + 3))
-                    & 0x7FFFFFFF
-                )
-                u = torch.rand(
-                    t.shape, generator=g, device=buf.device, dtype=torch.float32
-                )
-                u = torch.frac(u + phase / 8)
+                if self.mq_mode in ("latperm", "strat"):
+                    genp = torch.Generator(device=buf.device)
+                    genp.manual_seed(
+                        ((block * _SEED_MIX) ^ (state["sr_param_seed"] * 8 + 5))
+                        & 0x7FFFFFFF
+                    )
+                    R = torch.rand(
+                        (8, *t.shape), generator=genp, device=buf.device,
+                        dtype=torch.float32,
+                    )
+                    pi = (R < R[phase]).sum(0).float()
+                if self.mq_mode == "strat":
+                    genj = torch.Generator(device=buf.device)
+                    genj.manual_seed(
+                        ((self._sr_step_cnt * _SEED_MIX)
+                         ^ (state["sr_param_seed"] * 8 + 7))
+                        & 0x7FFFFFFF
+                    )
+                    xi = torch.rand(
+                        t.shape, generator=genj, device=buf.device,
+                        dtype=torch.float32,
+                    )
+                    u = (pi + xi) / 8
+                else:
+                    g = torch.Generator(device=buf.device)
+                    g.manual_seed(
+                        ((block * _SEED_MIX) ^ (state["sr_param_seed"] * 4 + 3))
+                        & 0x7FFFFFFF
+                    )
+                    u = torch.rand(
+                        t.shape, generator=g, device=buf.device, dtype=torch.float32
+                    )
+                    off = pi if self.mq_mode == "latperm" else phase
+                    u = torch.frac(u + off / 8)
             elif self.mq_mode == "qmc":
                 g = torch.Generator(device=buf.device)
                 g.manual_seed(

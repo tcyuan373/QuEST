@@ -76,6 +76,69 @@ check(
     not torch.allclose(us[0] + us[1], torch.ones_like(us[0]), atol=1e-3),
 )
 
+# --- latperm: same point set as lattice, random assignment ------------------
+gqp = GradAccumQuantizer(Toy(), "latperm", bits=4, acc_steps=M)
+up = torch.stack([gqp._u(3, i, 0, p0.shape, p0.device) for i in range(M)])
+sp, _ = up.reshape(M, -1).sort(dim=0)
+check(
+    "latperm uses the SAME point set as lattice (shared base seed)",
+    bool(torch.allclose(sp, su, atol=1e-6)),
+)
+check(
+    "latperm order differs from lattice's natural order",
+    not torch.allclose(up.reshape(M, -1), us.reshape(M, -1)),
+)
+# each stratum hit exactly once per coordinate: sorted draws stratified
+strata_p = torch.floor(sp * M)
+check(
+    "latperm hits every stratum exactly once per coordinate",
+    bool((strata_p == torch.arange(M).unsqueeze(1)).all()),
+)
+# permutations differ across coordinates (not one global shuffle)
+ranks = (up.reshape(M, -1).unsqueeze(1) > up.reshape(M, -1).unsqueeze(0)).sum(0)
+check(
+    "latperm permutation varies across coordinates",
+    bool((ranks != ranks[:, :1]).any()),
+)
+
+# --- strat: Latin-hypercube along the window axis ---------------------------
+gqs = GradAccumQuantizer(Toy(), "strat", bits=4, acc_steps=M)
+ust = torch.stack([gqs._u(3, i, 0, p0.shape, p0.device) for i in range(M)])
+ss, _ = ust.reshape(M, -1).sort(dim=0)
+check(
+    "strat is stratified: one draw per stratum per coordinate",
+    bool((torch.floor(ss * M) == torch.arange(M).unsqueeze(1)).all()),
+)
+# both modes must consume the SAME permutation stream: reconstruct pi from
+# the seed contract and check strat's stratum == pi and latperm's draw ==
+# frac(u_base + pi/M). (latperm's realized stratum is pi ROTATED by the
+# base shift, so the two strata differ pointwise by construction.)
+genr = torch.Generator()
+genr.manual_seed(((3 * 100003 + 0) * 8 + 6) & 0x7FFFFFFFFFFF)
+Rw = torch.rand((M, *p0.shape), generator=genr, dtype=torch.float32)
+pi_w = torch.stack([(Rw < Rw[i]).sum(0).float() for i in range(M)])
+genb = torch.Generator()
+genb.manual_seed(((3 * 100003 + 0) * 8 + 5) & 0x7FFFFFFFFFFF)
+u_base = torch.rand(p0.shape, generator=genb, dtype=torch.float32)
+check(
+    "strat stratum == shared-pi stream",
+    bool((torch.floor(ust * M) == pi_w).all()),
+)
+check(
+    "latperm == frac(u_base + pi/M) with the same pi stream",
+    bool(torch.allclose(up, torch.frac(u_base + pi_w / M), atol=1e-6)),
+)
+check(
+    "strat jitter is independent of the lattice shift (not the lattice set)",
+    not torch.allclose(ss, su, atol=1e-4),
+)
+# jitter fresh across windows: same micro, different step -> different offsets
+ust2 = gqs._u(4, 0, 0, p0.shape, p0.device)
+check(
+    "strat draws differ across optimizer steps",
+    not torch.allclose(ust[0], ust2, atol=1e-6),
+)
+
 # --- unbiasedness (each draw is marginally uniform via the random shift) ----
 TRIALS = 1200
 m = Toy()
@@ -140,11 +203,24 @@ def one_window(mode):
     run_window(gq, micros, step=5)
     return torch.cat([p.grad.float().flatten() for _, p in gq.params])
 
-for mode in ("lattice", "vdc"):
+for mode in ("lattice", "vdc", "latperm", "strat"):
     check(
         f"{mode} window reproducible (stateless seeding)",
         torch.equal(one_window(mode), one_window(mode)),
     )
+
+# strat's guaranteed property: window MSE <= iid on the correlated window
+e_strat, e_latperm = window_err("strat"), window_err("latperm")
+check(
+    "strat beats iid on the correlated window",
+    e_strat < 0.75 * e_iid,
+    f"mse strat={e_strat:.3e} latperm={e_latperm:.3e} iid={e_iid:.3e}",
+)
+check(
+    "latperm beats iid on the correlated window",
+    e_latperm < 0.75 * e_iid,
+    f"latperm/iid = {e_latperm / e_iid:.2f}",
+)
 
 # --- Muon mq lattice ---------------------------------------------------------
 def make_opt(mode, **kw):
@@ -189,6 +265,43 @@ def run_seq():
     )
 
 check("mq lattice sequence reproducible", torch.equal(run_seq(), run_seq()))
+
+# mq latperm shares lattice's point set per block; mq strat is stratified
+opt_p, params_p = make_opt("latperm")
+pp = params_p[0]
+state_p = opt_p.state[pp]
+xs = torch.randn_like(pp) * 0.05
+# reconstruct latperm's draws for one block directly from the seeding scheme
+genb = torch.Generator(device="cpu")
+genb.manual_seed(((0 * _SEED_MIX) ^ (state_p["sr_param_seed"] * 4 + 3)) & 0x7FFFFFFF)
+base_p = torch.rand(xs.shape, generator=genb, dtype=torch.float32)
+genr = torch.Generator(device="cpu")
+genr.manual_seed(((0 * _SEED_MIX) ^ (state_p["sr_param_seed"] * 8 + 5)) & 0x7FFFFFFF)
+Rb = torch.rand((8, *xs.shape), generator=genr, dtype=torch.float32)
+lp_set = torch.stack(
+    [torch.frac(base_p + (Rb < Rb[ph]).sum(0).float() / 8) for ph in range(8)]
+)
+slp, _ = lp_set.reshape(8, -1).sort(dim=0)
+slat = torch.stack([torch.frac(base_p + ph / 8) for ph in range(8)])
+slat, _ = slat.reshape(8, -1).sort(dim=0)
+check(
+    "mq latperm block point set == mq lattice block point set",
+    bool(torch.allclose(slp, slat, atol=1e-6)),
+)
+
+for mode in ("latperm", "strat"):
+    def run_seq_m(m=mode):
+        torch.manual_seed(11)
+        opt, params = make_opt(m)
+        torch.manual_seed(13)
+        for t in range(10):
+            for p in params:
+                p.grad = torch.randn_like(p)
+            opt.step()
+        return torch.cat(
+            [opt.state[p]["momentum_buffer"].flatten() for p in params]
+        )
+    check(f"mq {mode} sequence reproducible", torch.equal(run_seq_m(), run_seq_m()))
 
 print()
 if FAILS:

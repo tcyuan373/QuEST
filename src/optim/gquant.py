@@ -24,6 +24,24 @@ Modes:
   qmc -- antithetic SR: micro pairs (0,1),(2,3),... share u vs 1-u per
          coordinate, reconstructed from a Generator seeded by
          (opt step, pair id, param index) -- stateless, resume-safe.
+  lattice/vdc/latperm/strat -- window-level constructions over the m
+         micro-steps; per coordinate the window's m draws are
+           lattice: frac(u + i/m), natural order i = micro
+           vdc:     frac(u + i/m), bit-reversed order (m = 2^k only)
+           latperm: frac(u + pi(micro)/m), pi a fresh uniform random
+                    permutation per (step, param, coord) -- SAME point set
+                    and SAME base shift u as lattice (identical seed), so
+                    lattice-vs-latperm isolates the point->micro-step
+                    assignment, the nuisance that moved gq4 by 0.008
+                    between lattice and vdc.
+           strat:   (pi(micro) + xi_micro)/m, same pi stream as latperm
+                    but an INDEPENDENT within-stratum jitter xi per draw
+                    (Latin-hypercube along the window axis). Unlike any
+                    blind fixed point set, per-coordinate window variance
+                    is <= iid for every integrand -- the guaranteed-safe
+                    control.
+         All four share the Cranley-Patterson property that every single
+         draw is marginally U[0,1), hence unbiased.
 
 Index-clamp bounds for THIS grid (q = round-or-floor of t = x/step) are
 [-qmax, qmax]; validated against torch.round in test_gquant.py (the centered
@@ -38,7 +56,7 @@ import torch
 
 class GradAccumQuantizer:
     def __init__(self, model, mode, bits=8, headroom=1.0, acc_steps=8):
-        assert mode in ("det", "iid", "qmc", "lattice", "vdc")
+        assert mode in ("det", "iid", "qmc", "lattice", "vdc", "latperm", "strat")
         if mode == "vdc":
             # bit-reversal ordering needs a power-of-two window
             assert acc_steps & (acc_steps - 1) == 0, acc_steps
@@ -64,23 +82,39 @@ class GradAccumQuantizer:
         return (span / self.qmax).view(-1, *([1] * (g.ndim - 1)))
 
     def _u(self, step, micro, idx, shape, device):
-        if self.mode in ("lattice", "vdc"):
-            # "Loyal" randomized-QMC: ONE base draw per (step, param) window,
-            # then a length-m low-discrepancy set across the m micro-steps
-            # (Cranley-Patterson random shift keeps every draw uniform):
-            #   lattice: u_i = frac(u + i/m)   -- natural order
-            #   vdc:     u_i = frac(u + phi2(i)) -- same point set for m=2^k,
-            #            bit-reversed (van der Corput) order; 1-D Sobol and
-            #            Halton reduce to this, so those names are subsumed.
-            # Fresh seed scheme (does not collide with the iid/qmc streams).
+        if self.mode in ("lattice", "vdc", "latperm", "strat"):
+            # Window-level constructions (see module docstring). Seed layout:
+            #   ((step*100003 + idx)*8 + 5) -- base shift u, SHARED by
+            #       lattice/vdc/latperm so they use the identical point set;
+            #   ((step*100003 + idx)*8 + 6) -- permutation keys R, shared by
+            #       latperm/strat (same pi, differing only in the offset law);
+            #   ((step*64 + micro)*100003 + idx)*8 + 7 -- strat jitter, fresh
+            #       per micro-step.
+            # None collide with the iid/qmc streams.
+            m = self.acc_steps
+            if self.mode in ("latperm", "strat"):
+                # per-coordinate uniform permutation: rank of this micro's key
+                # among the window's m keys (float32 key ties are ~2^-24 rare
+                # and merely repeat a stratum for one window -- harmless)
+                genp = torch.Generator(device=device)
+                genp.manual_seed(((int(step) * 100003 + idx) * 8 + 6) & 0x7FFFFFFFFFFF)
+                R = torch.rand((m, *shape), generator=genp, device=device, dtype=torch.float32)
+                pi = (R < R[micro]).sum(0).float()
+                if self.mode == "strat":
+                    genj = torch.Generator(device=device)
+                    genj.manual_seed((((int(step) * 64 + micro) * 100003 + idx) * 8 + 7) & 0x7FFFFFFFFFFF)
+                    xi = torch.rand(shape, generator=genj, device=device, dtype=torch.float32)
+                    return (pi + xi) / m
+                i = pi  # latperm: lattice points, permuted assignment
+            else:
+                i = micro
+                if self.mode == "vdc":
+                    nbits = self.acc_steps.bit_length() - 1
+                    i = int(format(i, f"0{nbits}b")[::-1], 2) if nbits else 0
             gen = torch.Generator(device=device)
             gen.manual_seed(((int(step) * 100003 + idx) * 8 + 5) & 0x7FFFFFFFFFFF)
             u = torch.rand(shape, generator=gen, device=device, dtype=torch.float32)
-            i = micro
-            if self.mode == "vdc":
-                nbits = self.acc_steps.bit_length() - 1
-                i = int(format(i, f"0{nbits}b")[::-1], 2) if nbits else 0
-            return torch.frac(u + i / self.acc_steps)
+            return torch.frac(u + i / m)
         if self.mode == "qmc":
             pair, flip = micro // 2, micro % 2 == 1
         else:

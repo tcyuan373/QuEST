@@ -90,7 +90,7 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument(
         "--muon-mq-mode",
         default="none",
-        choices=["none", "det", "iid", "qmc", "lattice"],
+        choices=["none", "det", "iid", "qmc", "lattice", "latperm", "strat"],
     )
     parser.add_argument("--muon-mq-bits", default=8, type=int)
     parser.add_argument("--muon-mq-headroom", default=1.0, type=float)
@@ -99,7 +99,7 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument(
         "--gquant-mode",
         default="none",
-        choices=["none", "det", "iid", "qmc", "lattice", "vdc"],
+        choices=["none", "det", "iid", "qmc", "lattice", "vdc", "latperm", "strat"],
     )
     parser.add_argument("--gquant-bits", default=8, type=int)
     parser.add_argument("--gquant-headroom", default=1.0, type=float)
