@@ -195,6 +195,92 @@ Fp16 arm, 4-bit, protocol identical to the mode matrices above:
   +0.009, questbase +0.013) are ~1-3σ and inside the 0.008 assignment-noise
   band; only detbase (+0.040) and 100M (+0.017) clear it.
 
+## Seed campaign: error bars on the headline 4-bit cells (2026-08-16)
+
+Jobs 64184-64205 + 68072-88 resubmits (15 first-attempt startup failures =
+NFS makedirs race + one bad-mount node ellis-compute-02, fixed c9a0fa9;
+mq4iid s1/s2, mq4qmc s1 rerunning, node excluded). 3 seeds unless noted;
+mean ± sample σ; fp16 arm, c4slice, tier protocol; all runs carry the
+mechanism instrumentation.
+
+| 50M, 4-bit | det | iid | qmc | strat |
+|---|---|---|---|---|
+| gquant | 4.064 (2s: 4.053/4.075) | 3.833 ± 0.005 | 3.783 ± 0.013 | **3.775 ± 0.009** |
+| mquant | 3.665 ± 0.007 | 3.700 (1s, rest pending) | 3.653/3.654 (2s) | **3.652 ± 0.008** |
+
+| 100M slimpajama, 4-bit | det | iid | qmc | lattice | strat |
+|---|---|---|---|---|---|
+| mquant | 3.303 (1s) | 3.330 ± 0.010 | 3.275 (1s) | 3.292 (1s) | **3.286 ± 0.008** |
+| gquant (new at 100M) | — | 3.457 (1s) | — | — | **3.407 (1s)** |
+
+- **The headline claim now has error bars**: stratified-vs-iid is
+  −0.058 (gq4) and −0.048 (mq4) at 50M, −0.044 at 100M mq4 (3 seeds each
+  side, ~5σ of the mean difference) and −0.050 at 100M gquant (single
+  seed) — resolved beyond any noise argument, at both sites and both
+  scales.
+- **strat is best-or-tied everywhere**: edges qmc at gquant (3.775 vs
+  3.783, within σ — consistent with the P1 guarantee story, claimed only
+  as tie-or-better) and exactly ties it at mq (3.652 vs 3.653/3.654).
+- **mq det-vs-strat softens with seeds**: 3.665 ± 0.007 vs 3.652 ± 0.008
+  (Δ 0.013 ≈ 1.5σ) — the honest statement is "strat ≥ det at mq, decisive
+  only against iid"; gq det collapse is robust (4.053/4.075).
+- **Mechanism logs (first direct measurements, aggregate >Mech lines)**:
+  (a) gq window-error second moment tracks the SR loss ordering:
+  strat/qmc 0.57-0.58 < iid 0.98-0.99 step² — the predicted window-level
+  variance reduction, measured in training. (b) det breaks the pattern
+  in the INFORMATIVE way: its window err_ms is lowest (0.25) yet its loss
+  is catastrophic, and its stall rate is 0.97 vs SR's 0.80 — det's
+  failure is signal-correlated bias (swamping), not variance. (c) At mq,
+  per-step err_ms is IDENTICAL for strat and iid (0.1576 vs 0.1578) while
+  their losses differ by 0.048 — the strat win lives entirely in the
+  temporal correlation of errors across the window, which per-step
+  marginals cannot see. This is the cleanest evidence yet for the
+  window-cancellation mechanism (P2's closed forms predict exactly this).
+  (d) All SR modes: empirical bias ≤ 2e-5 in step units at both sites,
+  incl. the adaptive mq site (the theory-review concern: measured ~0).
+
+## Error feedback vs stratified SR: the memory-quality frontier (2026-08-16)
+
+EF implemented as an orthogonal knob (commits 8bcf2ab..d9eff6e: fp32
+residual = provably a full-precision master stored as quantized+residual;
+fp16 = memory-honest variant; bf16 buffer row = industry anchor). Jobs
+64943-50 + resubmits, fp16 arm, 50M. Optimizer-state bytes/param at the
+mq site (per-row scale amortizes to ~0):
+
+| arm | B/param | val_loss |
+|---|---|---|
+| fp32 buffer (ref) | 4.0 | 3.574 |
+| mq4 det + EF-fp32 (oracle) | 4.5 | 3.572 |
+| mq4 det + EF-fp16 | 2.5 | 3.571 / 3.565 (2s) |
+| bf16 buffer | 2.0 | 3.575 |
+| int8 det (mq8, prior table) | 1.0 | 3.575 |
+| **mq4 strat, no EF** | **0.5** | **3.652 ± 0.008** |
+
+gquant site: det+EF-fp32 3.583, det+EF-fp16 3.582/3.576 (vs det-no-EF
+4.053 — EF fully rescues the swamping collapse); **strat+EF-fp32 3.589 ≈
+det+EF 3.583**.
+
+- **EF restores reference quality at both sites** — but only at ≥2.5
+  B/param, where it is Pareto-dominated by the plain bf16 buffer (2.0)
+  and int8-det (1.0). Every compensated arm is interior to the frontier.
+- **The honest frontier**: {1.0 B: 3.575 int8-det} and {0.5 B: 3.652
+  strat} are its only interesting points — stratified SR is what exists
+  BELOW one byte per parameter, at +0.078. That is the paper's claim:
+  sub-byte optimizer state, not beating EF on quality.
+- **Substitution, not composition, confirmed in training**: strat+EF ==
+  det+EF (3.589 vs 3.583) — under exact error feedback, dither
+  correlation buys nothing, exactly as the telescoping theory predicts
+  and as the one-shot LDLQ table (antithetic == iid) already showed.
+  Stratification and EF are two routes to the same cancellation; strat is
+  the one that costs zero extra state.
+- **Residual-backlog watch (the review's instrumentation)**: mq residuals
+  bounded (max 0.5-0.57 steps; the site is provably clamp-inert). gq
+  residual max grows to ~90-138 steps on isolated rows (predicted
+  unbounded-backlog regime; mean-square stays 0.084, loss unharmed) —
+  the gq EF numbers carry this footnote.
+- bf16 buffer at 3.575 confirms the 2 B/param row is quality-free, as
+  industry practice assumes.
+
 ## Forward-pipeline three-way: us vs deterministic baselines vs QuEST (c4slice)
 
 Identical tier protocol, W4A4, finals @4096:
@@ -269,8 +355,9 @@ shows NO such fragility (sigma ~0.003-0.005).
 ## Grand synthesis
 
 SR's value lives in **temporal accumulation during training** — gradient
-accumulation (antithetic wins), seed stability, momentum (antithetic best
-and iid worst across 3 forward pipelines and 2 model scales) — NOT in
+accumulation, seed stability, momentum (stratified/antithetic best and iid
+worst across 3 forward pipelines and 2 model scales, now with 3-seed error
+bars and measured window-variance mechanism) — NOT in
 one-shot rounding (LDLQ wins), not inside strong forward pipelines (monotone
 penalty), and its forward-pass cost grows at low bits. Program ranking:
 G-quantization > master-weight/momentum storage > update compression.
