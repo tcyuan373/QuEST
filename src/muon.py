@@ -98,6 +98,7 @@ class Muon(torch.optim.Optimizer):
         mq_mode="none",  # "none" | "det" | "iid" | "qmc" -- momentum-buffer quant
         mq_bits=8,
         mq_headroom=1.0,
+        mq_ef="none",  # "none" | "fp32" | "fp16" -- error feedback on the buffer
     ):
 
         defaults = dict(
@@ -125,6 +126,13 @@ class Muon(torch.optim.Optimizer):
         assert mq_mode in (
             "none", "det", "iid", "qmc", "lattice", "latperm", "strat"
         ), mq_mode
+        assert mq_ef in ("none", "fp32", "fp16"), mq_ef
+        # Error feedback on the momentum buffer: persistent residual
+        # state["mq_resid"] (lives in optimizer state -> checkpointed) folded
+        # into the pre-quantization value each step and updated to the exact
+        # remainder incl. the bf16 storage-cast error. fp32 = quality upper
+        # bound (+4 B/param), fp16 = memory-honest variant (+2 B/param).
+        self.mq_ef = mq_ef
         self.mq_mode = mq_mode
         self.mq_bits = int(mq_bits)
         self.mq_headroom = float(mq_headroom)
@@ -371,7 +379,24 @@ class Muon(torch.optim.Optimizer):
                 prev_stored = buf.clone() if self.mq_mode != "none" else None
                 buf.mul_(momentum).add_(g)
                 if self.mq_mode != "none":
-                    out = self._mq_quantize(buf, state)
+                    if self.mq_ef != "none":
+                        if "mq_resid" not in state:
+                            state["mq_resid"] = torch.zeros_like(
+                                buf,
+                                dtype=torch.float16 if self.mq_ef == "fp16"
+                                else torch.float32,
+                            )
+                        # feed the residual THROUGH the momentum recursion:
+                        # buf already holds 0.95*prev + g, so adding 0.95*r
+                        # gives pre = 0.95*(prev + r) + g and buf+r tracks
+                        # the exact recursion (at fp32 residual this equals a
+                        # full-precision master buffer stored as quantized +
+                        # residual -- the quality upper bound). Adding r
+                        # undecayed would leak 0.05*r of drift per step.
+                        qin = buf.float() + momentum * state["mq_resid"].float()
+                    else:
+                        qin = buf
+                    out = self._mq_quantize(qin, state)
                     # mechanism instrumentation (observation only): per-step
                     # quantization error in step units -- the mean is the
                     # empirical bias check for this adaptive-threshold site --
@@ -384,7 +409,7 @@ class Muon(torch.optim.Optimizer):
                     # snapshots at a fixed log_interval would sample a fixed
                     # qmc parity / mod-8 window phase and bias the stats.
                     s = state["mq_step_size"]
-                    e = (out - buf) / s
+                    e = (out - qin) / s
                     if self._mech_acc is None:
                         z = lambda: torch.zeros((), device=buf.device, dtype=torch.float64)
                         self._mech_acc = {k: z() for k in
@@ -399,6 +424,12 @@ class Muon(torch.optim.Optimizer):
                         a["stall"] += ((out - prev_stored).abs() < 0.5 * s).sum()
                         a["stall_n"] += out.numel()
                     buf.copy_(out)
+                    if self.mq_ef != "none":
+                        # exact remainder, incl. the bf16 storage-cast error
+                        rn = qin - buf.float()
+                        state["mq_resid"] = (
+                            rn.half() if self.mq_ef == "fp16" else rn
+                        )
                 if group["nesterov"]:
                     g = g.add(buf, alpha=momentum)
                 else:

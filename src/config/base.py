@@ -94,6 +94,15 @@ def parse_args(base_parser, args, namespace):
     )
     parser.add_argument("--muon-mq-bits", default=8, type=int)
     parser.add_argument("--muon-mq-headroom", default=1.0, type=float)
+    # Error feedback on the quantized buffer/accumulator: fp32 residual =
+    # quality upper bound, fp16 = memory-honest variant. Baselines for the
+    # EF-vs-stratified-SR Pareto comparison.
+    parser.add_argument(
+        "--muon-mq-ef", default="none", choices=["none", "fp32", "fp16"]
+    )
+    parser.add_argument(
+        "--gquant-ef", default="none", choices=["none", "fp32", "fp16"]
+    )
     # G-quantization: simulate low-precision gradient ACCUMULATION,
     # G <- Q(G + g_micro) each micro-step (src/optim/gquant.py). Requires ws=1.
     parser.add_argument(

@@ -65,8 +65,20 @@ import torch
 
 
 class GradAccumQuantizer:
-    def __init__(self, model, mode, bits=8, headroom=1.0, acc_steps=8):
+    def __init__(self, model, mode, bits=8, headroom=1.0, acc_steps=8, ef="none"):
         assert mode in ("det", "iid", "qmc", "lattice", "vdc", "latperm", "strat")
+        assert ef in ("none", "fp32", "fp16"), ef
+        # Error feedback: a persistent residual r is folded into every
+        # micro-add and updated to the exact pre-quantization remainder,
+        # r <- (G_prev + g + r) - Q(G_prev + g + r). Carries ACROSS windows
+        # (standard EF semantics; the LDLQ-style sequential compensation the
+        # PTQ ladder showed dominating one-shot). Costs 4 (fp32) or 2 (fp16)
+        # bytes/param of extra state -- the memory-honesty comparison the
+        # paper's EF-vs-stratified-SR Pareto table reports. NOTE: the residual
+        # is NOT checkpointed (gquant keeps no persistent state across
+        # restarts), so a preemption resume restarts EF from zero -- a
+        # one-window-scale transient, acceptable for baseline runs.
+        self.ef = ef
         if mode == "vdc":
             # bit-reversal ordering needs a power-of-two window
             assert acc_steps & (acc_steps - 1) == 0, acc_steps
@@ -95,6 +107,7 @@ class GradAccumQuantizer:
         # Stats aggregate in float64 device tensors across windows and are
         # synced+reset only in mech_summary() (call at log intervals).
         self.shadow = [None] * len(self.params)
+        self.resid = [None] * len(self.params)  # EF residual (persistent)
         self._stall_sum = None  # device tensor, per-window, lazy init
         self._stall_n = 0
         self._mech_acc = None  # cross-window device accumulators
@@ -174,13 +187,24 @@ class GradAccumQuantizer:
                 self.shadow[idx] = torch.zeros_like(g)
             s = self.step_size[idx]
             prev = self.accum[idx]
-            t = (prev + g) / s
+            if self.ef != "none":
+                if self.resid[idx] is None:
+                    self.resid[idx] = torch.zeros_like(
+                        g, dtype=torch.float16 if self.ef == "fp16" else torch.float32
+                    )
+                pre = prev + g + self.resid[idx].float()
+            else:
+                pre = prev + g
+            t = pre / s
             if self.mode == "det":
                 q = torch.round(t)
             else:
                 q = torch.floor(t + self._u(step, micro, idx, t.shape, t.device))
             self.saturated += int((q.abs() > self.qmax).sum())
             new = q.clamp_(-self.qmax, self.qmax) * s
+            if self.ef != "none":
+                r = pre - new
+                self.resid[idx] = r.half() if self.ef == "fp16" else r
             if micro > 0:
                 # stall: the micro-add left the stored value unchanged
                 # (on-grid values compare exactly; micro 0 starts from zero

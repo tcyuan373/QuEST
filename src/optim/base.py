@@ -58,6 +58,7 @@ def train(
             bits=cfg.gquant_bits,
             headroom=cfg.gquant_headroom,
             acc_steps=cfg.acc_steps,
+            ef=getattr(cfg, "gquant_ef", "none"),
         )
         print(
             f"G-quant accumulation: mode={cfg.gquant_mode} bits={cfg.gquant_bits} "
