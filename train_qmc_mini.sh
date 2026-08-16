@@ -117,6 +117,8 @@ export MQUANT_HEADROOM=${MQUANT_HEADROOM:-1.0}
 # Error feedback (none|fp32|fp16); composes with any mode at either site
 export MQUANT_EF=${MQUANT_EF:-none}
 export GQUANT_EF=${GQUANT_EF:-none}
+# Momentum-buffer storage dtype (fp32|bf16); bf16 = the 2 B/param anchor row
+export MQUANT_BUF_DTYPE=${MQUANT_BUF_DTYPE:-fp32}
 export WARMUP_STEPS=$((ITERATIONS * WARMUP_PCT / 100))
 
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
@@ -160,6 +162,7 @@ torchrun --master_port=${MASTER_PORT} --nproc_per_node=${NUM_GPUS} ./src/main.py
     --muon-mq-headroom ${MQUANT_HEADROOM} \
     --muon-mq-ef ${MQUANT_EF} \
     --gquant-ef ${GQUANT_EF} \
+    --muon-buf-dtype ${MQUANT_BUF_DTYPE} \
     --weight-decay ${WD} \
     --experiment-name "qmc_${NAME_TAG}_${ARM}_${MODEL_SIZE}_${RUN_SUFFIX}" \
     --auto-resume ${AUTO_RESUME}

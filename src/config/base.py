@@ -103,6 +103,10 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument(
         "--gquant-ef", default="none", choices=["none", "fp32", "fp16"]
     )
+    # bf16 momentum-buffer storage: the 2 B/param industry-default anchor row
+    parser.add_argument(
+        "--muon-buf-dtype", default="fp32", choices=["fp32", "bf16"]
+    )
     # G-quantization: simulate low-precision gradient ACCUMULATION,
     # G <- Q(G + g_micro) each micro-step (src/optim/gquant.py). Requires ws=1.
     parser.add_argument(

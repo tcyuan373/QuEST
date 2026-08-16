@@ -167,6 +167,7 @@ def main(args):
             mq_bits=args.muon_mq_bits,
             mq_headroom=args.muon_mq_headroom,
             mq_ef=args.muon_mq_ef,
+            buf_dtype=args.muon_buf_dtype,
         )
         
     else:

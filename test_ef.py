@@ -144,6 +144,52 @@ same = all(
 )
 check("mq_resid round-trips through load_state_dict", same)
 
+# --- bf16 buffer-storage knob (the 2 B/param Pareto anchor row) --------------
+torch.manual_seed(11)
+params_b = [torch.nn.Parameter(torch.randn(16, 32)) for _ in range(2)]
+opt_b = Muon(
+    muon_params=params_b, adamw_params=[], lr=0.0, wd=0.0, buf_dtype="bf16"
+)
+torch.manual_seed(13)
+for t in range(3):
+    for p in params_b:
+        p.grad = torch.randn_like(p)
+    opt_b.step()
+check(
+    "buf_dtype=bf16 stores the momentum buffer in bfloat16",
+    all(opt_b.state[p]["momentum_buffer"].dtype == torch.bfloat16 for p in params_b),
+)
+sd_b = opt_b.state_dict()
+check(
+    "bf16 buffer round-trips state_dict with dtype",
+    all(
+        v["momentum_buffer"].dtype == torch.bfloat16
+        for v in sd_b["state"].values()
+        if "momentum_buffer" in v
+    ),
+)
+# bf16 buffer tracks the fp32 recursion to bf16 resolution
+shadow_b = {p: torch.zeros_like(p) for p in params_b}
+torch.manual_seed(13)
+opt_b2, = [Muon(muon_params=params_b, adamw_params=[], lr=0.0, wd=0.0, buf_dtype="bf16")]
+torch.manual_seed(13)
+for t in range(3):
+    for p in params_b:
+        g_ = torch.randn_like(p)
+        p.grad = g_.clone()
+        shadow_b[p] = 0.95 * shadow_b[p] + g_
+    opt_b2.step()
+check(
+    "bf16 buffer tracks fp32 recursion to bf16 resolution",
+    all(
+        torch.allclose(
+            opt_b2.state[p]["momentum_buffer"].float(), shadow_b[p],
+            rtol=0.02, atol=0.05,
+        )
+        for p in params_b
+    ),
+)
+
 # --- default-off leaves no residual state ------------------------------------
 opt0, params0 = make_opt("none")
 for p in params0:

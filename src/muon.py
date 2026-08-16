@@ -99,6 +99,7 @@ class Muon(torch.optim.Optimizer):
         mq_bits=8,
         mq_headroom=1.0,
         mq_ef="none",  # "none" | "fp32" | "fp16" -- error feedback on the buffer
+        buf_dtype="fp32",  # "fp32" | "bf16" -- momentum-buffer storage dtype
     ):
 
         defaults = dict(
@@ -133,6 +134,10 @@ class Muon(torch.optim.Optimizer):
         # remainder incl. the bf16 storage-cast error. fp32 = quality upper
         # bound (+4 B/param), fp16 = memory-honest variant (+2 B/param).
         self.mq_ef = mq_ef
+        # bf16 buffer = the industry-default 2 B/param anchor row for the
+        # EF-vs-SR Pareto table (no quantizer, just storage dtype)
+        assert buf_dtype in ("fp32", "bf16"), buf_dtype
+        self.buf_dtype = buf_dtype
         self.mq_mode = mq_mode
         self.mq_bits = int(mq_bits)
         self.mq_headroom = float(mq_headroom)
@@ -374,10 +379,14 @@ class Muon(torch.optim.Optimizer):
                 state = self.state[p]
                 buf_fresh = "momentum_buffer" not in state
                 if buf_fresh:
-                    state["momentum_buffer"] = torch.zeros_like(g)
+                    state["momentum_buffer"] = torch.zeros_like(
+                        g,
+                        dtype=torch.bfloat16 if self.buf_dtype == "bf16" else None,
+                    )
                 buf = state["momentum_buffer"]
                 prev_stored = buf.clone() if self.mq_mode != "none" else None
-                buf.mul_(momentum).add_(g)
+                # .to(buf.dtype) is a no-op on the default fp32 path
+                buf.mul_(momentum).add_(g.to(buf.dtype))
                 if self.mq_mode != "none":
                     if self.mq_ef != "none":
                         if "mq_resid" not in state:
