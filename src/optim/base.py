@@ -90,6 +90,14 @@ def train(
             cfg.device,
         )
         load_worker_state(ckpt_dir)
+        if hasattr(opt, "_sr_step_cnt"):
+            # Muon's QMC/window counter is a plain attribute, NOT part of
+            # optimizer state_dict, so a preemption resume silently reset it
+            # to 0 -- realigning antithetic pairs / lattice blocks to phase 0
+            # and REPLAYING the SR seed streams from the start of the run.
+            # Checkpoints are written before the iteration's opt.step(), so
+            # completed step() calls == saved itr, making this restore exact.
+            opt._sr_step_cnt = curr_iter
     else:
         curr_iter = 0
 
