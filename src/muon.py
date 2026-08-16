@@ -168,12 +168,16 @@ class Muon(torch.optim.Optimizer):
         a = self._mech_acc
         self._mech_acc = None
         n = max(float(a["n"]), 1.0)
-        return {
+        out = {
             "mq_err_mean": float(a["err"]) / n,
             "mq_err_ms": float(a["err_sq"]) / n,
             "mq_stall": float(a["stall"]) / max(float(a["stall_n"]), 1.0),
             "mq_sat": self.mq_saturated,
         }
+        if self.mq_ef != "none":
+            out["mq_resid_ms"] = float(a["resid_sq"]) / n
+            out["mq_resid_max"] = float(a["resid_max"])
+        return out
 
     def _qmc_sr_round(self, x, param_seed):
         """NS-then-round: stochastically round `x` onto a rowwise Gaussian-optimal
@@ -384,6 +388,11 @@ class Muon(torch.optim.Optimizer):
                         dtype=torch.bfloat16 if self.buf_dtype == "bf16" else None,
                     )
                 buf = state["momentum_buffer"]
+                if self.buf_dtype == "bf16" and buf.dtype != torch.bfloat16:
+                    # load_state_dict casts state tensors to the param dtype
+                    # (fp32), which would silently turn the 2 B/param anchor
+                    # arm into fp32 after any preemption resume -- re-cast
+                    buf = state["momentum_buffer"] = buf.bfloat16()
                 prev_stored = buf.clone() if self.mq_mode != "none" else None
                 # .to(buf.dtype) is a no-op on the default fp32 path
                 buf.mul_(momentum).add_(g.to(buf.dtype))
@@ -395,14 +404,21 @@ class Muon(torch.optim.Optimizer):
                                 dtype=torch.float16 if self.mq_ef == "fp16"
                                 else torch.float32,
                             )
-                        # feed the residual THROUGH the momentum recursion:
-                        # buf already holds 0.95*prev + g, so adding 0.95*r
-                        # gives pre = 0.95*(prev + r) + g and buf+r tracks
-                        # the exact recursion (at fp32 residual this equals a
-                        # full-precision master buffer stored as quantized +
-                        # residual -- the quality upper bound). Adding r
-                        # undecayed would leak 0.05*r of drift per step.
-                        qin = buf.float() + momentum * state["mq_resid"].float()
+                        # form the compensated master ENTIRELY in fp32 from
+                        # the stored state: pre = 0.95*(prev + r) + g, so
+                        # buf+r tracks the exact fp32 recursion for ANY
+                        # buffer storage dtype (a bf16 buf's mul_/add_ error
+                        # never contaminates the master; at fp32 residual
+                        # this equals a full-precision master buffer stored
+                        # as quantized + residual -- the quality upper
+                        # bound). Adding r undecayed would leak 0.05*r/step.
+                        # (prev + r) allocates a fresh tensor, so the in-place
+                        # ops cannot mutate prev_stored.
+                        qin = (
+                            (prev_stored.float() + state["mq_resid"].float())
+                            .mul_(momentum)
+                            .add_(g.float())
+                        )
                     else:
                         qin = buf
                     out = self._mq_quantize(qin, state)
@@ -422,7 +438,8 @@ class Muon(torch.optim.Optimizer):
                     if self._mech_acc is None:
                         z = lambda: torch.zeros((), device=buf.device, dtype=torch.float64)
                         self._mech_acc = {k: z() for k in
-                                          ("err", "err_sq", "n", "stall", "stall_n")}
+                                          ("err", "err_sq", "n", "stall", "stall_n",
+                                           "resid_sq", "resid_max")}
                     a = self._mech_acc
                     a["err"] += e.sum(dtype=torch.float64)
                     a["err_sq"] += (e * e).sum(dtype=torch.float64)
@@ -438,6 +455,11 @@ class Muon(torch.optim.Optimizer):
                         rn = qin - buf.float()
                         state["mq_resid"] = (
                             rn.half() if self.mq_ef == "fp16" else rn
+                        )
+                        rr = state["mq_resid"].float() / s
+                        a["resid_sq"] += (rr * rr).sum(dtype=torch.float64)
+                        a["resid_max"] = torch.maximum(
+                            a["resid_max"], rr.abs().max().double()
                         )
                 if group["nesterov"]:
                     g = g.add(buf, alpha=momentum)

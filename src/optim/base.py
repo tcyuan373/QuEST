@@ -283,6 +283,11 @@ def train(
                     f"gq_err_mean={m['gq_err_mean']:.3e} gq_err_ms={m['gq_err_ms']:.4e} "
                     f"gq_stall={m['gq_stall']:.4f} gq_sat={m['gq_sat']}"
                 )
+                if "gq_resid_ms" in m:
+                    mech_bits.append(
+                        f"gq_resid_ms={m['gq_resid_ms']:.4e} "
+                        f"gq_resid_max={m['gq_resid_max']:.3e}"
+                    )
             if getattr(opt, "mq_mode", "none") != "none":
                 m = opt.mq_mech_summary()
                 if m is not None:
@@ -290,6 +295,11 @@ def train(
                         f"mq_err_mean={m['mq_err_mean']:.3e} mq_err_ms={m['mq_err_ms']:.4e} "
                         f"mq_stall={m['mq_stall']:.4f} mq_sat={m['mq_sat']}"
                     )
+                    if "mq_resid_ms" in m:
+                        mech_bits.append(
+                            f"mq_resid_ms={m['mq_resid_ms']:.4e} "
+                            f"mq_resid_max={m['mq_resid_max']:.3e}"
+                        )
             if mech_bits:
                 print(f">Mech: Iter={curr_iter} " + " ".join(mech_bits))
 

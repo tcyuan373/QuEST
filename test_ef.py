@@ -123,6 +123,63 @@ for mode in ("det", "iid"):
                 )
         check(f"mq {mode}+ef-{ef} invariant buf+resid==exact recursion", ok)
 
+# --- bf16 buffer + EF: master must track the EXACT fp32 recursion ------------
+# (the compensated master is formed in fp32 from prev_stored + r, so bf16
+# buffer arithmetic never contaminates it)
+torch.manual_seed(11)
+params_be = [torch.nn.Parameter(torch.randn(16, 32)) for _ in range(2)]
+opt_be = Muon(
+    muon_params=params_be, adamw_params=[], lr=0.0, wd=0.0,
+    mq_mode="det", mq_bits=4, mq_ef="fp32", buf_dtype="bf16",
+)
+shadow_be = {p: torch.zeros_like(p) for p in params_be}
+torch.manual_seed(13)
+ok = True
+for t in range(5):
+    for p in params_be:
+        g_ = torch.randn_like(p)
+        p.grad = g_.clone()
+        shadow_be[p] = 0.95 * shadow_be[p] + g_
+    opt_be.step()
+    for p in params_be:
+        st = opt_be.state[p]
+        ok = ok and torch.allclose(
+            st["momentum_buffer"].float() + st["mq_resid"].float(),
+            shadow_be[p], atol=1e-4,
+        )
+check("bf16 buffer + fp32 EF: master tracks exact fp32 recursion", ok)
+
+# --- residual-backlog logging (the runaway watch) ----------------------------
+gq_r = GradAccumQuantizer(Toy(), "det", bits=4, acc_steps=M, ef="fp32")
+gr = {p: torch.randn_like(p) * 0.3 for _, p in gq_r.params}
+for micro in range(M):
+    for (_, p) in gq_r.params:
+        p.grad = gr[p].clone()
+    gq_r.accumulate(0, micro)
+gq_r.write_back()
+mr = gq_r.mech_summary()
+check(
+    "gq EF logs residual norms (backlog watch)",
+    "gq_resid_ms" in mr and mr["gq_resid_ms"] >= 0.0 and "gq_resid_max" in mr,
+    f"resid_ms={mr.get('gq_resid_ms')}, resid_max={mr.get('gq_resid_max')}",
+)
+gq_n = GradAccumQuantizer(Toy(), "det", bits=4, acc_steps=M)
+for micro in range(M):
+    for (_, p) in gq_n.params:
+        p.grad = gr[p].clone() if p in gr else torch.randn_like(p)
+    gq_n.accumulate(0, micro)
+gq_n.write_back()
+check("no resid keys when ef=none", "gq_resid_ms" not in gq_n.mech_summary())
+opt_rl, params_rl = make_opt("fp32", "det")
+for p in params_rl:
+    p.grad = torch.randn_like(p)
+opt_rl.step()
+mrl = opt_rl.mq_mech_summary()
+check(
+    "mq EF logs residual norms",
+    "mq_resid_ms" in mrl and mrl["mq_resid_ms"] >= 0.0,
+)
+
 # --- mq residual lives in optimizer state (checkpointed -> resume-safe) ------
 opt, params = make_opt("fp32")
 for p in params:
@@ -167,6 +224,20 @@ check(
         for v in sd_b["state"].values()
         if "momentum_buffer" in v
     ),
+)
+# THE resume trap: load_state_dict casts state to the PARAM dtype (fp32), so
+# without the re-cast guard the anchor arm silently becomes fp32 after any
+# preemption resume. Assert the POST-load, post-step dtype.
+torch.manual_seed(11)
+params_r = [torch.nn.Parameter(torch.randn(16, 32)) for _ in range(2)]
+opt_r = Muon(muon_params=params_r, adamw_params=[], lr=0.0, wd=0.0, buf_dtype="bf16")
+opt_r.load_state_dict(sd_b)
+for p in params_r:
+    p.grad = torch.randn_like(p)
+opt_r.step()
+check(
+    "bf16 buffer stays bf16 AFTER load_state_dict + step (resume trap)",
+    all(opt_r.state[p]["momentum_buffer"].dtype == torch.bfloat16 for p in params_r),
 )
 # bf16 buffer tracks the fp32 recursion to bf16 resolution
 shadow_b = {p: torch.zeros_like(p) for p in params_b}

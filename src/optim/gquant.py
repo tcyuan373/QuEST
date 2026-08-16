@@ -74,10 +74,14 @@ class GradAccumQuantizer:
         # (standard EF semantics; the LDLQ-style sequential compensation the
         # PTQ ladder showed dominating one-shot). Costs 4 (fp32) or 2 (fp16)
         # bytes/param of extra state -- the memory-honesty comparison the
-        # paper's EF-vs-stratified-SR Pareto table reports. NOTE: the residual
-        # is NOT checkpointed (gquant keeps no persistent state across
-        # restarts), so a preemption resume restarts EF from zero -- a
-        # one-window-scale transient, acceptable for baseline runs.
+        # paper's EF-vs-stratified-SR Pareto table reports. CAVEATS: (a) the
+        # clamp breaks the compressor-contraction property, so under
+        # persistent saturation the residual backlog grows without bound and
+        # saturation becomes self-sustaining -- the resid norms are logged in
+        # mech_summary() precisely so runs are interpretable in that regime;
+        # (b) the residual is NOT checkpointed, so a preemption resume drops
+        # the backlog -- an O(|r|) transient, which under saturation can be
+        # many windows of mass, not one.
         self.ef = ef
         if mode == "vdc":
             # bit-reversal ordering needs a power-of-two window
@@ -230,11 +234,20 @@ class GradAccumQuantizer:
                 if self._mech_acc is None:
                     z = lambda: torch.zeros((), device=e.device, dtype=torch.float64)
                     self._mech_acc = {k: z() for k in
-                                      ("err", "err_sq", "n", "stall", "stall_n")}
+                                      ("err", "err_sq", "n", "stall", "stall_n",
+                                       "resid_sq", "resid_max")}
                 a = self._mech_acc
                 a["err"] += e.sum(dtype=torch.float64)
                 a["err_sq"] += (e * e).sum(dtype=torch.float64)
                 a["n"] += e.numel()
+                if self.ef != "none":
+                    # EF backlog watch: unbounded growth here means the
+                    # clamp is feeding the residual faster than it drains
+                    rr = self.resid[idx].float() / self.step_size[idx]
+                    a["resid_sq"] += (rr * rr).sum(dtype=torch.float64)
+                    a["resid_max"] = torch.maximum(
+                        a["resid_max"], rr.abs().max().double()
+                    )
                 self.shadow[idx] = None  # free between windows
         if self._mech_acc is not None and self._stall_sum is not None:
             self._mech_acc["stall"] += self._stall_sum
@@ -253,9 +266,13 @@ class GradAccumQuantizer:
         self._mech_acc = None
         sat, self._sat_acc = self._sat_acc, 0
         n = max(float(a["n"]), 1.0)
-        return {
+        out = {
             "gq_err_mean": float(a["err"]) / n,
             "gq_err_ms": float(a["err_sq"]) / n,
             "gq_stall": float(a["stall"]) / max(float(a["stall_n"]), 1.0),
             "gq_sat": sat,
         }
+        if self.ef != "none":
+            out["gq_resid_ms"] = float(a["resid_sq"]) / n
+            out["gq_resid_max"] = float(a["resid_max"])
+        return out
