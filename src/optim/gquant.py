@@ -88,6 +88,14 @@ class GradAccumQuantizer:
         self.accum = [None] * len(self.params)
         self.step_size = [None] * len(self.params)
         self.saturated = 0  # coords clamped in the current optimizer step
+        # mechanism instrumentation (observation only, no effect on training):
+        # fp32 shadow of the exact accumulation for window-error stats, plus
+        # per-micro stall (swamping/round-back) counting. Shadow costs one
+        # fp32 tensor per param (~4 bytes/param transient).
+        self.shadow = [None] * len(self.params)
+        self._stall_sum = None  # device tensor, lazy init
+        self._stall_n = 0
+        self.mech = None  # per-window snapshot dict, filled at write_back
 
     def _row_step(self, g):
         absmax = g.abs().flatten(1).amax(dim=1).clamp_min(1e-12)
@@ -151,6 +159,8 @@ class GradAccumQuantizer:
         and clear .grad so the next backward produces a fresh gradient."""
         if micro == 0:
             self.saturated = 0
+            self._stall_sum = None
+            self._stall_n = 0
         for idx, (_, p) in enumerate(self.params):
             if p.grad is None:
                 continue
@@ -158,20 +168,50 @@ class GradAccumQuantizer:
             if micro == 0:
                 self.step_size[idx] = self._row_step(g)
                 self.accum[idx] = torch.zeros_like(g)
+                self.shadow[idx] = torch.zeros_like(g)
             s = self.step_size[idx]
-            t = (self.accum[idx] + g) / s
+            prev = self.accum[idx]
+            t = (prev + g) / s
             if self.mode == "det":
                 q = torch.round(t)
             else:
                 q = torch.floor(t + self._u(step, micro, idx, t.shape, t.device))
             self.saturated += int((q.abs() > self.qmax).sum())
-            self.accum[idx] = q.clamp_(-self.qmax, self.qmax) * s
+            new = q.clamp_(-self.qmax, self.qmax) * s
+            if micro > 0:
+                # stall: the micro-add left the stored value unchanged
+                # (on-grid values compare exactly; micro 0 starts from zero
+                # so its "stall" would just measure zero-rounded grads)
+                st = (new == prev).sum()
+                self._stall_sum = st if self._stall_sum is None else self._stall_sum + st
+                self._stall_n += new.numel()
+            self.accum[idx] = new
+            self.shadow[idx] = self.shadow[idx] + g
             p.grad = None
 
     @torch.no_grad()
     def write_back(self):
         """After the last micro-step: expose the quantized accumulation as .grad
-        for clipping + the optimizer."""
+        for clipping + the optimizer, and snapshot the window mechanism stats
+        (error vs the exact fp32 shadow, in step units; stall rate; saturation).
+        The stats sync the GPU once per optimizer step -- negligible."""
+        err = err_sq = None
+        n = 0
         for idx, (_, p) in enumerate(self.params):
             if self.accum[idx] is not None:
                 p.grad = self.accum[idx].to(p.dtype)
+                e = (self.accum[idx] - self.shadow[idx]) / self.step_size[idx]
+                if err is None:
+                    err, err_sq = e.sum(), (e * e).sum()
+                else:
+                    err, err_sq = err + e.sum(), err_sq + (e * e).sum()
+                n += e.numel()
+        if n:
+            self.mech = {
+                "gq_err_mean": float(err) / n,
+                "gq_err_ms": float(err_sq) / n,
+                "gq_stall": float(self._stall_sum) / max(self._stall_n, 1)
+                if self._stall_sum is not None
+                else 0.0,
+                "gq_sat": self.saturated,
+            }

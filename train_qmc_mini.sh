@@ -45,8 +45,10 @@ export DATASET=${DATASET:-slimpajama}   # slimpajama | minipile | redpajama | ..
 # Seed study: SEED varies init/training RNG AND the data order (data-seed
 # offsets with it), so cross-seed spread measures total run-to-run variance.
 # NOTE: the QMC antithetic streams are seeded by (step, pair, instance), NOT by
-# torch's seed — across SEEDs the qmc arms share their SR noise sequence; iid
-# arms draw from the torch RNG and vary fully.
+# torch's seed — across SEEDs the qmc arms share their SR noise sequence. Since
+# 2026-08-15 mq-iid also uses a stateless stream (was global torch RNG), so ALL
+# gquant/mq dither modes share their noise across SEEDs; only forward-weight
+# iid arms (QMCSRSTEQuantizer qmc=false) still draw from the torch RNG.
 export SEED=${SEED:-0}
 
 # Model size: 50M (default) or 100M, matching train.sh recipes

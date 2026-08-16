@@ -416,6 +416,84 @@ for mode in ("lattice", "latperm", "strat"):
         ok = ok and torch.equal(out, want)
     check(f"mq {mode} realized draws match seed contract (2 blocks)", ok)
 
+# --- mechanism instrumentation (observation only) ---------------------------
+gqm = GradAccumQuantizer(Toy(), "iid", bits=4, acc_steps=M)
+gm = {p: torch.randn_like(p) * 0.1 for _, p in gqm.params}
+run_window(gqm, [gm] * M, step=7)
+check(
+    "gquant shadow equals exact fp32 accumulation",
+    all(
+        torch.allclose(gqm.shadow[i], M * gm[p], atol=1e-5)
+        for i, (_, p) in enumerate(gqm.params)
+    ),
+)
+check(
+    "gquant mech snapshot populated and sane",
+    gqm.mech is not None
+    and 0.0 <= gqm.mech["gq_stall"] <= 1.0
+    and gqm.mech["gq_err_ms"] >= 0.0,
+    str(gqm.mech),
+)
+# swamping detection: big first micro-grad sets the grid, tiny later grads;
+# det rounds them all away (stall 1, negative bias), SR moves some coords and
+# stays near-unbiased
+res = {}
+for mode in ("det", "iid"):
+    torch.manual_seed(21)  # same big grads for both modes
+    gq_ = GradAccumQuantizer(Toy(), mode, bits=4, acc_steps=M)
+    big = {p: torch.randn_like(p) for _, p in gq_.params}
+    tiny = {p: torch.full_like(p, 0.1) for _, p in gq_.params}
+    run_window(gq_, [big] + [tiny] * (M - 1), step=1)
+    res[mode] = gq_.mech
+check(
+    "det swamps tiny micro-grads (stall ~1), SR does not",
+    res["det"]["gq_stall"] > 0.999 and res["iid"]["gq_stall"] < res["det"]["gq_stall"],
+    f"det {res['det']['gq_stall']:.4f} iid {res['iid']['gq_stall']:.4f}",
+)
+check(
+    "det swamping shows as bias, SR stays near-unbiased",
+    abs(res["det"]["gq_err_mean"]) > 5 * abs(res["iid"]["gq_err_mean"]),
+    f"det {res['det']['gq_err_mean']:.3e} iid {res['iid']['gq_err_mean']:.3e}",
+)
+
+# mq mech: populated after a step, sane ranges; None when mq is off
+opt_me, params_me = make_opt("iid")
+torch.manual_seed(3)
+for _ in range(3):
+    for p in params_me:
+        p.grad = torch.randn_like(p)
+    opt_me.step()
+mm = opt_me.mq_mech_summary()
+check(
+    "mq mech summary populated and sane",
+    mm is not None and 0.0 <= mm["mq_stall"] <= 1.0 and mm["mq_err_ms"] >= 0.0,
+    str(mm),
+)
+opt_none, params_none = make_opt("none")
+for p in params_none:
+    p.grad = torch.randn_like(p)
+opt_none.step()
+check("mq mech is None when mq_mode=none", opt_none.mq_mech_summary() is None)
+
+# mq iid must use its own stream: identical outputs under different global RNG
+# states (the pre-2026-08-15 torch.rand_like implementation fails this)
+opt_i, params_i = make_opt("iid")
+pi_ = params_i[0]
+st_i = opt_i.state[pi_]
+xi_ = torch.randn_like(pi_) * 0.05
+outs = []
+for gseed in (1, 2):
+    torch.manual_seed(gseed)
+    opt_i._sr_step_cnt = 5
+    outs.append(opt_i._mq_quantize(xi_, st_i))
+check("mq iid draws independent of global RNG state", torch.equal(outs[0], outs[1]))
+# and fresh across steps
+opt_i._sr_step_cnt = 6
+check(
+    "mq iid draws differ across steps",
+    not torch.equal(outs[0], opt_i._mq_quantize(xi_, st_i)),
+)
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")

@@ -272,6 +272,25 @@ def train(
                 f"lr={current_lrs[0]:.2e}"
             )
 
+            # mechanism instrumentation: parseable snapshot of the last step's
+            # quantization-error stats (see gquant.write_back / Muon.mq_mech_summary)
+            mech_bits = []
+            if gq is not None and gq.mech:
+                m = gq.mech
+                mech_bits.append(
+                    f"gq_err_mean={m['gq_err_mean']:.3e} gq_err_ms={m['gq_err_ms']:.4e} "
+                    f"gq_stall={m['gq_stall']:.4f} gq_sat={m['gq_sat']}"
+                )
+            if getattr(opt, "mq_mode", "none") != "none":
+                m = opt.mq_mech_summary()
+                if m is not None:
+                    mech_bits.append(
+                        f"mq_err_mean={m['mq_err_mean']:.3e} mq_err_ms={m['mq_err_ms']:.4e} "
+                        f"mq_stall={m['mq_stall']:.4f} mq_sat={m['mq_sat']}"
+                    )
+            if mech_bits:
+                print(f">Mech: Iter={curr_iter} " + " ".join(mech_bits))
+
             if cfg.wandb:
                 wandb.log(
                     {

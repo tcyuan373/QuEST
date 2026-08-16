@@ -129,6 +129,7 @@ class Muon(torch.optim.Optimizer):
         self.mq_bits = int(mq_bits)
         self.mq_headroom = float(mq_headroom)
         self.mq_saturated = 0  # coords clamped in the current optimizer step
+        self._mech_acc = None  # mechanism accumulators for the current step
 
         for idx, p in enumerate(muon_params):
             # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
@@ -140,6 +141,22 @@ class Muon(torch.optim.Optimizer):
         for p in adamw_params:
             # Do not use Muon for parameters in adamw_params
             self.state[p]["use_muon"] = False
+
+    def mq_mech_summary(self):
+        """Sync and return the current step's mechanism metrics (step units):
+        err_mean (empirical bias), err_ms (error second moment), stall
+        (round-back/staleness rate), sat (clamped coords). Costs one GPU sync
+        -- call at log intervals only."""
+        if self._mech_acc is None:
+            return None
+        a = self._mech_acc
+        n = max(float(a["n"]), 1.0)
+        return {
+            "mq_err_mean": float(a["err"]) / n,
+            "mq_err_ms": float(a["err_sq"]) / n,
+            "mq_stall": float(a["stall"]) / n,
+            "mq_sat": self.mq_saturated,
+        }
 
     def _qmc_sr_round(self, x, param_seed):
         """NS-then-round: stochastically round `x` onto a rowwise Gaussian-optimal
@@ -276,7 +293,21 @@ class Muon(torch.optim.Optimizer):
                 if parity == 1:
                     u = 1.0 - u
             else:
-                u = torch.rand_like(t)
+                # iid: dedicated stateless stream (residue family *8+1,
+                # fresh per step). Was torch.rand_like (GLOBAL RNG) before
+                # 2026-08-15 -- that made the iid arm the only mode coupled
+                # to other global-RNG consumers and non-resume-reproducible;
+                # distributionally identical, so old iid results remain
+                # valid samples, but new runs use this stream.
+                g = torch.Generator(device=buf.device)
+                g.manual_seed(
+                    ((self._sr_step_cnt * _SEED_MIX)
+                     ^ (state["sr_param_seed"] * 8 + 1))
+                    & 0x7FFFFFFF
+                )
+                u = torch.rand(
+                    t.shape, generator=g, device=buf.device, dtype=torch.float32
+                )
             q = torch.floor(t + u)
         self.mq_saturated += int((q.abs() > qmax).sum())
         return (q.clamp_(-qmax, qmax) * s).to(buf.dtype)
@@ -301,6 +332,7 @@ class Muon(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
         self.mq_saturated = 0
+        self._mech_acc = None  # per-step mechanism accumulators (lazy device init)
 
         for group in self.param_groups:
 
@@ -329,9 +361,26 @@ class Muon(torch.optim.Optimizer):
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(g)
                 buf = state["momentum_buffer"]
+                prev_stored = buf.clone() if self.mq_mode != "none" else None
                 buf.mul_(momentum).add_(g)
                 if self.mq_mode != "none":
-                    buf.copy_(self._mq_quantize(buf, state))
+                    out = self._mq_quantize(buf, state)
+                    # mechanism instrumentation (observation only): per-step
+                    # quantization error in step units -- the mean is the
+                    # empirical bias check for this adaptive-threshold site --
+                    # and the round-back/stall rate (fraction of coords whose
+                    # stored value did not move; = staleness probability).
+                    # Accumulated as device tensors; synced only at log time.
+                    e = (out - buf) / state["mq_step_size"]
+                    if self._mech_acc is None:
+                        z = lambda: torch.zeros((), device=buf.device, dtype=torch.float64)
+                        self._mech_acc = {k: z() for k in ("err", "err_sq", "stall", "n")}
+                    a = self._mech_acc
+                    a["err"] += e.sum()
+                    a["err_sq"] += (e * e).sum()
+                    a["stall"] += (out == prev_stored).sum()
+                    a["n"] += e.numel()
+                    buf.copy_(out)
                 if group["nesterov"]:
                     g = g.add(buf, alpha=momentum)
                 else:

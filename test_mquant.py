@@ -126,7 +126,10 @@ acc = None
 sizes = None
 for t in range(TRIALS):
     opt, params = make_opt("iid", bits=4, n=1, shape=(16, 32))
-    torch.manual_seed(1000 + t)  # drives torch.rand_like in iid mode
+    # iid draws come from a dedicated stream keyed by _sr_step_cnt (since
+    # 2026-08-15; was global-RNG torch.rand_like) -- vary the step counter to
+    # get an independent draw per trial
+    opt._sr_step_cnt = t
     step_with(opt, params, [tgt])
     b = bufs(opt, params)[0].float()
     acc = b if acc is None else acc + b
