@@ -419,7 +419,10 @@ for mode in ("lattice", "latperm", "strat"):
 # --- mechanism instrumentation (observation only) ---------------------------
 gqm = GradAccumQuantizer(Toy(), "iid", bits=4, acc_steps=M)
 gm = {p: torch.randn_like(p) * 0.1 for _, p in gqm.params}
-run_window(gqm, [gm] * M, step=7)
+for micro in range(M):  # window WITHOUT write_back so the shadow is inspectable
+    for (_, p) in gqm.params:
+        p.grad = gm[p].clone()
+    gqm.accumulate(7, micro)
 check(
     "gquant shadow equals exact fp32 accumulation",
     all(
@@ -427,12 +430,19 @@ check(
         for i, (_, p) in enumerate(gqm.params)
     ),
 )
+gqm.write_back()
 check(
-    "gquant mech snapshot populated and sane",
-    gqm.mech is not None
-    and 0.0 <= gqm.mech["gq_stall"] <= 1.0
-    and gqm.mech["gq_err_ms"] >= 0.0,
-    str(gqm.mech),
+    "gquant shadow freed at write_back",
+    all(s is None for s in gqm.shadow),
+)
+mg = gqm.mech_summary()
+check(
+    "gquant mech summary populated, sane, and drains",
+    mg is not None
+    and 0.0 <= mg["gq_stall"] <= 1.0
+    and mg["gq_err_ms"] >= 0.0
+    and gqm.mech_summary() is None,
+    str(mg),
 )
 # swamping detection: big first micro-grad sets the grid, tiny later grads;
 # det rounds them all away (stall 1, negative bias), SR moves some coords and
@@ -444,7 +454,7 @@ for mode in ("det", "iid"):
     big = {p: torch.randn_like(p) for _, p in gq_.params}
     tiny = {p: torch.full_like(p, 0.1) for _, p in gq_.params}
     run_window(gq_, [big] + [tiny] * (M - 1), step=1)
-    res[mode] = gq_.mech
+    res[mode] = gq_.mech_summary()
 check(
     "det swamps tiny micro-grads (stall ~1), SR does not",
     res["det"]["gq_stall"] > 0.999 and res["iid"]["gq_stall"] < res["det"]["gq_stall"],
@@ -468,6 +478,31 @@ check(
     "mq mech summary populated and sane",
     mm is not None and 0.0 <= mm["mq_stall"] <= 1.0 and mm["mq_err_ms"] >= 0.0,
     str(mm),
+)
+check("mq mech summary drains on read", opt_me.mq_mech_summary() is None)
+# stall metric detects genuinely stale buffers: with zero gradients the buffer
+# and its absmax grid both scale by exactly 0.95, so every stored value moves
+# 0.05|q| <= 0.37 steps < s/2 -> stall must read ~1; with real grads it is low
+for _ in range(3):
+    for p in params_me:
+        p.grad = torch.zeros_like(p)
+    opt_me.step()
+ms_stale = opt_me.mq_mech_summary()
+check(
+    "mq stall reads ~1 on zero-grad (stale) buffers",
+    ms_stale["mq_stall"] > 0.99,
+    f"stall {ms_stale['mq_stall']:.4f}",
+)
+torch.manual_seed(17)
+for _ in range(3):
+    for p in params_me:
+        p.grad = torch.randn_like(p)
+    opt_me.step()
+ms_live = opt_me.mq_mech_summary()
+check(
+    "mq stall low on live buffers",
+    ms_live["mq_stall"] < 0.5 * ms_stale["mq_stall"],
+    f"stall {ms_live['mq_stall']:.4f}",
 )
 opt_none, params_none = make_opt("none")
 for p in params_none:

@@ -91,11 +91,14 @@ class GradAccumQuantizer:
         # mechanism instrumentation (observation only, no effect on training):
         # fp32 shadow of the exact accumulation for window-error stats, plus
         # per-micro stall (swamping/round-back) counting. Shadow costs one
-        # fp32 tensor per param (~4 bytes/param transient).
+        # fp32 tensor per param during the window; freed at write_back.
+        # Stats aggregate in float64 device tensors across windows and are
+        # synced+reset only in mech_summary() (call at log intervals).
         self.shadow = [None] * len(self.params)
-        self._stall_sum = None  # device tensor, lazy init
+        self._stall_sum = None  # device tensor, per-window, lazy init
         self._stall_n = 0
-        self.mech = None  # per-window snapshot dict, filled at write_back
+        self._mech_acc = None  # cross-window device accumulators
+        self._sat_acc = 0
 
     def _row_step(self, g):
         absmax = g.abs().flatten(1).amax(dim=1).clamp_min(1e-12)
@@ -192,26 +195,43 @@ class GradAccumQuantizer:
     @torch.no_grad()
     def write_back(self):
         """After the last micro-step: expose the quantized accumulation as .grad
-        for clipping + the optimizer, and snapshot the window mechanism stats
-        (error vs the exact fp32 shadow, in step units; stall rate; saturation).
-        The stats sync the GPU once per optimizer step -- negligible."""
-        err = err_sq = None
-        n = 0
+        for clipping + the optimizer, and fold the window's mechanism stats
+        (error vs the exact fp32 shadow in step units; stall; saturation) into
+        the cross-window accumulators. No host sync here -- device tensors
+        only; sync happens in mech_summary()."""
         for idx, (_, p) in enumerate(self.params):
             if self.accum[idx] is not None:
                 p.grad = self.accum[idx].to(p.dtype)
                 e = (self.accum[idx] - self.shadow[idx]) / self.step_size[idx]
-                if err is None:
-                    err, err_sq = e.sum(), (e * e).sum()
-                else:
-                    err, err_sq = err + e.sum(), err_sq + (e * e).sum()
-                n += e.numel()
-        if n:
-            self.mech = {
-                "gq_err_mean": float(err) / n,
-                "gq_err_ms": float(err_sq) / n,
-                "gq_stall": float(self._stall_sum) / max(self._stall_n, 1)
-                if self._stall_sum is not None
-                else 0.0,
-                "gq_sat": self.saturated,
-            }
+                if self._mech_acc is None:
+                    z = lambda: torch.zeros((), device=e.device, dtype=torch.float64)
+                    self._mech_acc = {k: z() for k in
+                                      ("err", "err_sq", "n", "stall", "stall_n")}
+                a = self._mech_acc
+                a["err"] += e.sum(dtype=torch.float64)
+                a["err_sq"] += (e * e).sum(dtype=torch.float64)
+                a["n"] += e.numel()
+                self.shadow[idx] = None  # free between windows
+        if self._mech_acc is not None and self._stall_sum is not None:
+            self._mech_acc["stall"] += self._stall_sum
+            self._mech_acc["stall_n"] += self._stall_n
+        self._sat_acc += self.saturated
+
+    def mech_summary(self):
+        """Sync, return, and RESET the mechanism metrics aggregated over every
+        window since the previous call (step units): err_mean, err_ms (window
+        error vs exact fp32 accumulation), stall (micro-adds that left the
+        stored accumulator unchanged; micro 0 excluded), sat (clamped coords).
+        One GPU sync -- call at log intervals only."""
+        if self._mech_acc is None:
+            return None
+        a = self._mech_acc
+        self._mech_acc = None
+        sat, self._sat_acc = self._sat_acc, 0
+        n = max(float(a["n"]), 1.0)
+        return {
+            "gq_err_mean": float(a["err"]) / n,
+            "gq_err_ms": float(a["err_sq"]) / n,
+            "gq_stall": float(a["stall"]) / max(float(a["stall_n"]), 1.0),
+            "gq_sat": sat,
+        }

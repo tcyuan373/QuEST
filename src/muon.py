@@ -143,18 +143,22 @@ class Muon(torch.optim.Optimizer):
             self.state[p]["use_muon"] = False
 
     def mq_mech_summary(self):
-        """Sync and return the current step's mechanism metrics (step units):
-        err_mean (empirical bias), err_ms (error second moment), stall
-        (round-back/staleness rate), sat (clamped coords). Costs one GPU sync
-        -- call at log intervals only."""
+        """Sync, return, and RESET the mechanism metrics aggregated over every
+        step since the previous call (step units): err_mean (empirical bias),
+        err_ms (error second moment), stall (staleness rate: stored value
+        moved < s/2 on the current grid; excludes each buffer's creation
+        step), sat (clamped coords, last step only). Aggregating across the
+        whole log window covers all qmc parities / mod-8 phases uniformly.
+        Costs one GPU sync -- call at log intervals only."""
         if self._mech_acc is None:
             return None
         a = self._mech_acc
+        self._mech_acc = None
         n = max(float(a["n"]), 1.0)
         return {
             "mq_err_mean": float(a["err"]) / n,
             "mq_err_ms": float(a["err_sq"]) / n,
-            "mq_stall": float(a["stall"]) / n,
+            "mq_stall": float(a["stall"]) / max(float(a["stall_n"]), 1.0),
             "mq_sat": self.mq_saturated,
         }
 
@@ -332,7 +336,9 @@ class Muon(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
         self.mq_saturated = 0
-        self._mech_acc = None  # per-step mechanism accumulators (lazy device init)
+        # NOTE: _mech_acc deliberately NOT reset here -- it aggregates across
+        # steps until mq_mech_summary() drains it (per-step snapshots at a
+        # fixed log interval would be phase-locked to the qmc/window streams)
 
         for group in self.param_groups:
 
@@ -358,7 +364,8 @@ class Muon(torch.optim.Optimizer):
 
                 # calc update
                 state = self.state[p]
-                if "momentum_buffer" not in state:
+                buf_fresh = "momentum_buffer" not in state
+                if buf_fresh:
                     state["momentum_buffer"] = torch.zeros_like(g)
                 buf = state["momentum_buffer"]
                 prev_stored = buf.clone() if self.mq_mode != "none" else None
@@ -368,18 +375,29 @@ class Muon(torch.optim.Optimizer):
                     # mechanism instrumentation (observation only): per-step
                     # quantization error in step units -- the mean is the
                     # empirical bias check for this adaptive-threshold site --
-                    # and the round-back/stall rate (fraction of coords whose
-                    # stored value did not move; = staleness probability).
-                    # Accumulated as device tensors; synced only at log time.
-                    e = (out - buf) / state["mq_step_size"]
+                    # and the stall rate: |out - prev_stored| < s/2, i.e. the
+                    # stored value moved by less than half a step on the
+                    # CURRENT grid (staleness probability; exact equality
+                    # would be dead across the per-step-rescaled grids).
+                    # Accumulated in float64 device tensors ACROSS steps and
+                    # synced+reset only in mq_mech_summary() -- per-step
+                    # snapshots at a fixed log_interval would sample a fixed
+                    # qmc parity / mod-8 window phase and bias the stats.
+                    s = state["mq_step_size"]
+                    e = (out - buf) / s
                     if self._mech_acc is None:
                         z = lambda: torch.zeros((), device=buf.device, dtype=torch.float64)
-                        self._mech_acc = {k: z() for k in ("err", "err_sq", "stall", "n")}
+                        self._mech_acc = {k: z() for k in
+                                          ("err", "err_sq", "n", "stall", "stall_n")}
                     a = self._mech_acc
-                    a["err"] += e.sum()
-                    a["err_sq"] += (e * e).sum()
-                    a["stall"] += (out == prev_stored).sum()
+                    a["err"] += e.sum(dtype=torch.float64)
+                    a["err_sq"] += (e * e).sum(dtype=torch.float64)
                     a["n"] += e.numel()
+                    if not buf_fresh:
+                        # skip the creation step: prev is all-zeros there and
+                        # "stall" would just count zero-rounded first values
+                        a["stall"] += ((out - prev_stored).abs() < 0.5 * s).sum()
+                        a["stall_n"] += out.numel()
                     buf.copy_(out)
                 if group["nesterov"]:
                     g = g.add(buf, alpha=momentum)

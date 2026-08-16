@@ -272,11 +272,12 @@ def train(
                 f"lr={current_lrs[0]:.2e}"
             )
 
-            # mechanism instrumentation: parseable snapshot of the last step's
-            # quantization-error stats (see gquant.write_back / Muon.mq_mech_summary)
+            # mechanism instrumentation: parseable aggregate over all steps
+            # since the previous log line (drain-on-read; per-step snapshots
+            # would be phase-locked to the qmc/window streams)
             mech_bits = []
-            if gq is not None and gq.mech:
-                m = gq.mech
+            m = gq.mech_summary() if gq is not None else None
+            if m is not None:
                 mech_bits.append(
                     f"gq_err_mean={m['gq_err_mean']:.3e} gq_err_ms={m['gq_err_ms']:.4e} "
                     f"gq_stall={m['gq_stall']:.4f} gq_sat={m['gq_sat']}"
