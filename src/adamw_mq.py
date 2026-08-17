@@ -4,10 +4,14 @@ every step -- the optimizer-generality arm of the QMC-SR program.
 Same accumulate-without-error-feedback structure as Muon's mq site
 (src/muon.py): the stored m1 is on-grid between steps, torch's step computes
 m_t = beta1*Q(m_{t-1}) + (1-beta1)*g_t internally, and we re-quantize the
-stored tensor afterwards. The parameter update each step consumes the
-freshly-computed (unquantized) m_t; only the PERSISTENT state is low-bit --
-the honest bytes/param semantics, mirroring mq where NS consumes the
-quantized buffer.
+stored tensor afterwards. Consumption semantics differ from Muon by ONE
+STEP: here the update consumes the fresh unquantized m_t (each rounding
+error reaches the weights from step s+1 onward) -- the standard convention
+of the low-bit-optimizer-state literature (bitsandbytes 8-bit Adam, Li et
+al. 2023 4-bit states), where "4-bit optimizer state" means INTER-STEP
+STORAGE -- while Muon's NS consumes Q(buf_t) at step s itself, the strictly
+harsher variant. The stored-state recursion the window-cancellation
+mechanism acts on is identical at both sites.
 
 Scope: quantizes exp_avg of >=2D non-embedding params only (the exact Muon
 partition, for apples-to-apples with the mq tables); embeddings/norms/
@@ -39,6 +43,7 @@ class MQAdamW(torch.optim.AdamW):
     ):
         super().__init__(params, **kw)
         assert m1_mode in ("none", "det", "iid", "qmc", "strat"), m1_mode
+        assert int(m1_bits) >= 2, m1_bits  # bits=1 => qmax=0, div-by-zero
         self.mq_mode = m1_mode  # name shared with Muon for base.py logging
         self.m1_bits = int(m1_bits)
         self.m1_headroom = float(m1_headroom)
