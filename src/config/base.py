@@ -107,6 +107,15 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument(
         "--muon-buf-dtype", default="fp32", choices=["fp32", "bf16"]
     )
+    # AdamW first-moment storage quantization (src/adamw_mq.py) -- the
+    # optimizer-generality arm; exp_avg_sq deliberately not covered
+    parser.add_argument(
+        "--adamw-m1-mode",
+        default="none",
+        choices=["none", "det", "iid", "qmc", "strat"],
+    )
+    parser.add_argument("--adamw-m1-bits", default=4, type=int)
+    parser.add_argument("--adamw-m1-headroom", default=1.0, type=float)
     # G-quantization: simulate low-precision gradient ACCUMULATION,
     # G <- Q(G + g_micro) each micro-step (src/optim/gquant.py). Requires ws=1.
     parser.add_argument(

@@ -119,6 +119,9 @@ export MQUANT_EF=${MQUANT_EF:-none}
 export GQUANT_EF=${GQUANT_EF:-none}
 # Momentum-buffer storage dtype (fp32|bf16); bf16 = the 2 B/param anchor row
 export MQUANT_BUF_DTYPE=${MQUANT_BUF_DTYPE:-fp32}
+# AdamW first-moment quantization (OPT=adamw only)
+export ADAMW_M1_MODE=${ADAMW_M1_MODE:-none}
+export ADAMW_M1_BITS=${ADAMW_M1_BITS:-4}
 export WARMUP_STEPS=$((ITERATIONS * WARMUP_PCT / 100))
 
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
@@ -163,6 +166,8 @@ torchrun --master_port=${MASTER_PORT} --nproc_per_node=${NUM_GPUS} ./src/main.py
     --muon-mq-ef ${MQUANT_EF} \
     --gquant-ef ${GQUANT_EF} \
     --muon-buf-dtype ${MQUANT_BUF_DTYPE} \
+    --adamw-m1-mode ${ADAMW_M1_MODE} \
+    --adamw-m1-bits ${ADAMW_M1_BITS} \
     --weight-decay ${WD} \
     --experiment-name "qmc_${NAME_TAG}_${ARM}_${MODEL_SIZE}_${RUN_SUFFIX}" \
     --auto-resume ${AUTO_RESUME}

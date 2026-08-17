@@ -132,12 +132,31 @@ def main(args):
         )
 
     if args.opt == "adamw":
-        opt = torch.optim.AdamW(
+        from adamw_mq import MQAdamW
+
+        # m1 quantization targets the exact Muon partition (>=2D, no
+        # embeddings) for apples-to-apples with the mq tables
+        m1_qparams = [
+            p
+            for name, p in model.named_parameters()
+            if p.ndim >= 2
+            and not name.endswith(("wte.weight", "lm_head.weight"))
+        ]
+        opt = MQAdamW(
             group_specs,
+            m1_quant_params=m1_qparams,
+            m1_mode=args.adamw_m1_mode,
+            m1_bits=args.adamw_m1_bits,
+            m1_headroom=args.adamw_m1_headroom,
             lr=args.lr,
             betas=(args.beta1, args.beta2),
             weight_decay=args.weight_decay,
         )
+        if args.adamw_m1_mode != "none":
+            print(
+                f"AdamW m1-quant: mode={args.adamw_m1_mode} "
+                f"bits={args.adamw_m1_bits} over {len(m1_qparams)} matrices"
+            )
     elif args.opt == "SFAdamW":
         opt = schedulefree.AdamWScheduleFree(
             group_specs,
