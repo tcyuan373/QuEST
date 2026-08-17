@@ -197,16 +197,16 @@ Fp16 arm, 4-bit, protocol identical to the mode matrices above:
 
 ## Seed campaign: error bars on the headline 4-bit cells (2026-08-16)
 
-Jobs 64184-64205 + 68072-88 resubmits (15 first-attempt startup failures =
-NFS makedirs race + one bad-mount node ellis-compute-02, fixed c9a0fa9;
-mq4iid s1/s2, mq4qmc s1 rerunning, node excluded). 3 seeds unless noted;
+Jobs 64184-64205 + 68072-88 + 71668-70 resubmits (15 first-attempt startup
+failures = NFS makedirs race + one bad-mount node ellis-compute-02, fixed
+c9a0fa9 and node excluded; all cells complete). 3 seeds unless noted;
 mean ± sample σ; fp16 arm, c4slice, tier protocol; all runs carry the
 mechanism instrumentation.
 
 | 50M, 4-bit | det | iid | qmc | strat |
 |---|---|---|---|---|
 | gquant | 4.064 (2s: 4.053/4.075) | 3.833 ± 0.005 | 3.783 ± 0.013 | **3.775 ± 0.009** |
-| mquant | 3.665 ± 0.007 | 3.700 (1s, rest pending) | 3.653/3.654 (2s) | **3.652 ± 0.008** |
+| mquant | 3.665 ± 0.007 | 3.699 ± 0.007 | **3.651 ± 0.004** | 3.652 ± 0.008 |
 
 | 100M slimpajama, 4-bit | det | iid | qmc | lattice | strat |
 |---|---|---|---|---|---|
@@ -214,13 +214,15 @@ mechanism instrumentation.
 | gquant (new at 100M) | — | 3.457 (1s) | — | — | **3.407 (1s)** |
 
 - **The headline claim now has error bars**: stratified-vs-iid is
-  −0.058 (gq4) and −0.048 (mq4) at 50M, −0.044 at 100M mq4 (3 seeds each
-  side, ~5σ of the mean difference) and −0.050 at 100M gquant (single
+  −0.058 (gq4) and −0.047 (mq4) at 50M, −0.044 at 100M mq4 (3 seeds each
+  side, ~5-8σ of the mean difference) and −0.050 at 100M gquant (single
   seed) — resolved beyond any noise argument, at both sites and both
   scales.
-- **strat is best-or-tied everywhere**: edges qmc at gquant (3.775 vs
-  3.783, within σ — consistent with the P1 guarantee story, claimed only
-  as tie-or-better) and exactly ties it at mq (3.652 vs 3.653/3.654).
+- **The guaranteed pair {qmc, strat} is best-or-tied everywhere**: strat
+  edges qmc at gquant (3.775 vs 3.783, within σ — consistent with the P1
+  guarantee story, claimed only as tie-or-better) and they tie exactly at
+  mq (3.652 ± 0.008 vs 3.651 ± 0.004) — precisely the two constructions
+  with the NA variance guarantee (THEORY.md P1) topping both tables.
 - **mq det-vs-strat softens with seeds**: 3.665 ± 0.007 vs 3.652 ± 0.008
   (Δ 0.013 ≈ 1.5σ) — the honest statement is "strat ≥ det at mq, decisive
   only against iid"; gq det collapse is robust (4.053/4.075).
