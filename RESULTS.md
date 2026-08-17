@@ -283,6 +283,40 @@ det+EF 3.583**.
 - bf16 buffer at 3.575 confirms the 2 B/param row is quality-free, as
   industry practice assumes.
 
+## Optimizer generality: AdamW first-moment quantization (2026-08-17)
+
+MQAdamW (src/adamw_mq.py): exp_avg stored in 4 bits between steps
+(bnb/Li-et-al inter-step-storage convention; Muon mq is the stricter
+consume-quantized variant — one-step phase shift of the same recursion).
+Same grid/streams/partition as mq. Jobs 81151-57, 50M c4slice tier,
+fp16 arm, 2 seeds:
+
+| AdamW, m1 4-bit | none (anchor) | det | iid | strat |
+|---|---|---|---|---|
+| val_loss | 3.612 | **3.660 ± 0.002** | 3.734 ± 0.020 | 3.683 ± 0.018 |
+
+- **Stratified-vs-iid TRANSFERS off-Muon**: −0.051 (paired in both seeds:
+  3.670<3.720, 3.696<3.748), the same magnitude as Muon mq's −0.047. The
+  core claim — iid dither is the wrong default for accumulated quantized
+  state — is optimizer-general. The title can say "optimizer state".
+- **But det does not fail here**: 3.660 ± 0.002, best at this site. Unlike
+  gquant (det collapses +0.48) and Muon mq (det trails strat by 0.013),
+  4-bit det round-to-nearest is fine for the beta1=0.9 Adam EMA —
+  consistent with the low-bit-optimizer literature quantizing Adam moments
+  deterministically at 4b, and with the faster EMA's lower staleness
+  exposure (mech: m1 stall 0.65-0.75 vs err_ms det 0.064 = half of SR's
+  0.12-0.14). The honest generality statement: WHERE stochastic rounding
+  is needed (det collapses or destabilizes), stratification is how to do
+  it; where det suffices (Adam m1 at 4b), SR of any kind costs a little.
+  det's known failure regime is 2-3 bits (SOLO/staleness literature) —
+  out of scope here.
+- SR arms are ~10x seed-noisier than det at this site (sigma ~0.02 vs
+  0.002) — worth a line, unexplained.
+- AdamW anchor 3.612 vs Muon fp16 3.574 at the same budget: Muon's known
+  edge, and why Muon is the paper's primary stress case (largest single
+  buffer, strictest consumption semantics).
+- Empirical bias ~= 0 at this site too (|err_mean| <= 9e-6 step units).
+
 ## Forward-pipeline three-way: us vs deterministic baselines vs QuEST (c4slice)
 
 Identical tier protocol, W4A4, finals @4096:
