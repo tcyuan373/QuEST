@@ -317,6 +317,39 @@ fp16 arm, 2 seeds:
   buffer, strictest consumption semantics).
 - Empirical bias ~= 0 at this site too (|err_mean| <= 9e-6 step units).
 
+## Composability: gq4 + mq4 quantized simultaneously (2026-08-20)
+
+The "4-bit-state trainer" cell (PAPER_PLAN.md week 2, critic's catch):
+gradient accumulator AND momentum buffer both 4-bit, same dither mode at
+both sites. Jobs 177473 + 188333-35 (177470-72 were ellis-compute-02
+startup casualties, resubmitted), 50M c4slice tier, fp16 arm, 2 seeds.
+Sites draw from structurally different stream families (gquant linear
+step*100003+idx vs mq XOR-mixed sr_param_seed), so cross-site dither is
+uncorrelated by construction.
+
+| gq4+mq4 | observed | additive prediction (fp16 3.574 + single-site penalties) |
+|---|---|---|
+| strat | **3.806 ± 0.004** {3.809, 3.803} | 3.853 (= 3.574 + 0.201 + 0.078) |
+| iid | 3.895 ± 0.006 {3.899, 3.891} | 3.958 (= 3.574 + 0.259 + 0.125) |
+
+- **Degradation is SUBadditive in both modes**: observed dual penalty
+  0.232 vs 0.279 predicted (strat, −0.047) and 0.321 vs 0.384 (iid,
+  −0.063). The two quantized states do not interact badly — if anything
+  the mq site partially absorbs gq-injected noise. Additive-or-better was
+  the bar for the headline framing; subadditive clears it.
+- **The stratification advantage compounds across sites**: dual-site
+  strat-vs-iid is −0.089 (paired in both seeds: 3.809<3.899, 3.803<3.891),
+  vs −0.058 (gq) and −0.047 (mq) alone — close to the sum of the
+  single-site gaps (−0.105).
+- Mechanism (final >Mech, s0): strat cuts gq window-error mean-square ~40%
+  vs iid (gq_err_ms 0.579 vs 0.989) with mq_err_ms essentially unchanged
+  (0.142 vs 0.144); bias ~0 at both sites (|err_mean| <= 2e-5). The
+  variance reduction, not a bias effect, carries the dual-site win —
+  consistent with THEORY.md P1/P2.
+- Natural headline demo: full 4-bit optimizer+accumulator state under
+  stratified SR costs +0.232 at 50M; the same states under iid SR cost
+  +0.321 — a third more.
+
 ## Forward-pipeline three-way: us vs deterministic baselines vs QuEST (c4slice)
 
 Identical tier protocol, W4A4, finals @4096:
@@ -397,6 +430,10 @@ bars and measured window-variance mechanism) — NOT in
 one-shot rounding (LDLQ wins), not inside strong forward pipelines (monotone
 penalty), and its forward-pass cost grows at low bits. Program ranking:
 G-quantization > master-weight/momentum storage > update compression.
+The two training-state sites COMPOSE subadditively (gq4+mq4 dual-site
+penalty below the sum of single-site penalties in both dither modes), and
+the strat-vs-iid gap compounds to −0.089 — the "4-bit-state trainer"
+framing survives its own stress test.
 Within the family of **blind time-axis point sets** the construction looks
 saturated: antithetic/lattice/vdc/latperm/strat all land within ~0.012 of
 each other (fine ordering unresolved at single-seed noise; strat best at
